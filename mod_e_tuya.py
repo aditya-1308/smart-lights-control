@@ -74,23 +74,40 @@ _NEUTRAL_BRI: int = 60
 # -----------------------------------------------------------------------
 def _start_hotkey_listener() -> None:
     """
-    Listen for Ctrl+Shift+L to toggle Tuya ambient on/off.
-    Runs in a daemon thread started by pynput.
+    Hotkeys:
+      Ctrl+Shift+L        : toggle ambient on/off
+      Ctrl+Shift+Up       : brightness +5% (max 100%)
+      Ctrl+Shift+Down     : brightness -5% (min 1%)
     """
     if not PYNPUT_AVAILABLE:
-        log.warning("pynput not installed — hotkey toggle unavailable.")
+        log.warning("pynput not installed — hotkeys unavailable.")
         return
 
     def on_toggle():
         state.tuya_ambient_enabled = not state.tuya_ambient_enabled
         status = "ON" if state.tuya_ambient_enabled else "OFF"
-        log.info("Tuya ambient toggled: %s (Ctrl+Shift+L)", status)
+        log.info("Tuya ambient toggled: %s  (brightness %d%%)",
+                 status, state.tuya_brightness)
+
+    def on_brightness_up():
+        state.tuya_brightness = min(100, state.tuya_brightness + 5)
+        log.info("Tuya brightness: %d%%", state.tuya_brightness)
+
+    def on_brightness_down():
+        state.tuya_brightness = max(1, state.tuya_brightness - 5)
+        log.info("Tuya brightness: %d%%", state.tuya_brightness)
 
     hotkeys = pynput_keyboard.GlobalHotKeys({
-        "<ctrl>+<shift>+l": on_toggle,
+        "<ctrl>+<shift>+l":   on_toggle,
+        "<ctrl>+<shift>+<up>": on_brightness_up,
+        "<ctrl>+<shift>+<down>": on_brightness_down,
     })
     hotkeys.start()
-    log.info("Tuya hotkey registered: Ctrl+Shift+L to toggle ambient control.")
+    log.info(
+        "Tuya hotkeys: Ctrl+Shift+L=toggle | "
+        "Ctrl+Shift+Up/Down=brightness (current: %d%%)",
+        state.tuya_brightness,
+    )
 
 
 # -----------------------------------------------------------------------
@@ -352,16 +369,17 @@ async def run() -> None:
         sampled = await asyncio.to_thread(sampler.sample)
 
         if sampled is None:
-            # Screen is very dark — fade toward neutral gently
-            target = _NEUTRAL_RGB
-            target_bri = _MIN_BRIGHTNESS_PCT
+            # Screen is very dark — dim to minimum but keep current hue
+            target = last_color
+            target_bri = 1
         else:
             target = sampled
-            target_bri = _rgb_to_brightness(sampled)
+            target_bri = state.tuya_brightness  # Always use manual brightness
 
-        # Only update if color changed meaningfully (avoid spamming Tuya)
-        delta = sum(abs(target[i] - last_color[i]) for i in range(3))
-        if delta > 15:  # threshold to avoid constant micro-updates
+        # Only update if color changed meaningfully OR brightness changed
+        bri_delta = abs(target_bri - ctrl._current_bri)
+        color_delta = sum(abs(target[i] - last_color[i]) for i in range(3))
+        if color_delta > 15 or bri_delta >= 5:
             asyncio.create_task(ctrl.transition_to(target, target_bri))
             last_color = target
 
