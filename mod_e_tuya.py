@@ -90,11 +90,11 @@ def _start_hotkey_listener() -> None:
                  status, state.tuya_brightness)
 
     def on_brightness_up():
-        state.tuya_brightness = min(100, state.tuya_brightness + 5)
+        state.tuya_brightness = min(100, state.tuya_brightness + 1)
         log.info("Tuya brightness: %d%%", state.tuya_brightness)
 
     def on_brightness_down():
-        state.tuya_brightness = max(1, state.tuya_brightness - 5)
+        state.tuya_brightness = max(1, state.tuya_brightness - 1)
         log.info("Tuya brightness: %d%%", state.tuya_brightness)
 
     hotkeys = pynput_keyboard.GlobalHotKeys({
@@ -256,6 +256,28 @@ class TuyaBulbController:
             log.error("Tuya connection failed: %s", exc)
             return False
 
+    def _sync_set_brightness_instant(self, brightness_pct: int) -> None:
+        """Blocking: set brightness instantly with no fade."""
+        if not self._device:
+            return
+        try:
+            bri = max(1, min(100, brightness_pct))
+            self._device.set_brightness_percentage(bri, nowait=True)
+            self._current_bri = bri
+        except Exception as exc:
+            log.debug("Tuya brightness instant error: %s", exc)
+            self._connected = False
+
+    async def set_brightness_instant(self, brightness_pct: int) -> None:
+        """Set brightness instantly (no crossfade). Cancels any running fade."""
+        if self._transition_task and not self._transition_task.done():
+            self._transition_task.cancel()
+            try:
+                await self._transition_task
+            except asyncio.CancelledError:
+                pass
+        await asyncio.to_thread(self._sync_set_brightness_instant, brightness_pct)
+
     def _sync_set_color(self, rgb: RGB, brightness_pct: int) -> None:
         """Blocking: send color + brightness to the bulb."""
         if not self._device:
@@ -379,9 +401,14 @@ async def run() -> None:
         # Only update if color changed meaningfully OR brightness changed
         bri_delta = abs(target_bri - ctrl._current_bri)
         color_delta = sum(abs(target[i] - last_color[i]) for i in range(3))
-        if color_delta > 15 or bri_delta >= 5:
+
+        if color_delta > 15:
+            # Color changed — smooth crossfade
             asyncio.create_task(ctrl.transition_to(target, target_bri))
             last_color = target
+        elif bri_delta >= 1:
+            # Brightness-only change — instant, no fade
+            asyncio.create_task(ctrl.set_brightness_instant(target_bri))
 
         # Reconnect if dropped
         if not ctrl._connected:
