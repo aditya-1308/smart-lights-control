@@ -80,6 +80,9 @@ class SharedState:
         self.cs2_health: int = 100
         self.cs2_flashed: int = 0          # 0–255
 
+        # -- Tuya ambient --
+        self.tuya_ambient_enabled: bool = True  # Toggle via hotkey
+
         # -- Seg 0 (109 LEDs) --
         self.seg0_source: Seg0Source = Seg0Source.SCREEN_CAPTURE
         self.seg0_colors: List[tuple] = [(0, 0, 0)] * 109  # current 109-LED frame

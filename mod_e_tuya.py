@@ -1,26 +1,28 @@
 """
-mod_e_tuya.py — Ambient ceiling light control via local Tuya protocol.
+mod_e_tuya.py — Ambient ceiling light driven by live screen color.
 
-Controls the Homemate (Tuya-based) ceiling bulb on the local network.
-No cloud dependency — communicates directly over LAN via tinytuya.
+Samples the average color of your screen every 0.5 seconds and smoothly
+crossfades the Tuya ceiling bulb to match, creating a cinematic ambient
+glow that works universally for games, movies, and desktop use.
 
 Features:
-  - Monitors state.context and crossfades to the appropriate color.
-  - Smooth 20-step ease-in-out crossfade over 2 seconds.
-  - Persistent TCP socket (set_socketPersistent) for low-latency commands.
-  - Updates infrequently — only on context change, not every frame.
+  - Dark pixel filtering: ignores pixels below brightness threshold so
+    dark scenes don't wash the room in muddy grey or turn the light off.
+  - Smooth 2-second ease-in-out crossfade between color updates.
+  - Hotkey toggle (Ctrl+Shift+L): instantly switch between RoomLights
+    control and manual/uncontrolled (bulb untouched).
+  - Uses the same dxcam/mss backend as mod_screen_capture.py.
 
-Context → color mapping is defined in config.TUYA_CONTEXT_MAP.
-
-Prerequisite: obtain Tuya local key via:
-  python -m tinytuya wizard
-Then paste TUYA_DEVICE_ID, TUYA_LOCAL_KEY, TUYA_IP into .env.
+Prerequisite: Tuya credentials in .env (TUYA_DEVICE_ID, TUYA_LOCAL_KEY, TUYA_IP).
+Get them with: python -m tinytuya wizard
 """
 
 import asyncio
 import logging
 import time
-from typing import Tuple
+from typing import Optional, Tuple
+
+import numpy as np
 
 try:
     import tinytuya
@@ -28,21 +30,166 @@ try:
 except ImportError:
     TINYTUYA_AVAILABLE = False
 
+try:
+    from pynput import keyboard as pynput_keyboard
+    PYNPUT_AVAILABLE = True
+except ImportError:
+    PYNPUT_AVAILABLE = False
+
+# Screen capture backend (reuse from mod_screen_capture logic)
+try:
+    import dxcam
+    _USE_DXCAM = True
+except ImportError:
+    _USE_DXCAM = False
+    try:
+        import mss as mss_mod
+    except ImportError:
+        pass
+
 import config
-from state import state, AppContext
+from state import state
 
 log = logging.getLogger("tuya")
 
 RGB = Tuple[int, int, int]
 
+# -----------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------
+_SAMPLE_INTERVAL = 0.5          # seconds between screen samples
+_CROSSFADE_DURATION = 2.0       # seconds to fade to new color
+_CROSSFADE_STEPS = 20           # interpolation steps
+_DARK_THRESHOLD = 40            # pixel brightness (0-255) below which to ignore
+_MIN_BRIGHTNESS_PCT = 20        # minimum bulb brightness % (prevent turning off)
+_MAX_BRIGHTNESS_PCT = 90        # maximum bulb brightness %
 
+# Neutral warm white used when ambient is disabled or no screen data
+_NEUTRAL_RGB: RGB = (255, 200, 120)
+_NEUTRAL_BRI: int = 60
+
+
+# -----------------------------------------------------------------------
+# Hotkey listener (runs in background thread via pynput)
+# -----------------------------------------------------------------------
+def _start_hotkey_listener() -> None:
+    """
+    Listen for Ctrl+Shift+L to toggle Tuya ambient on/off.
+    Runs in a daemon thread started by pynput.
+    """
+    if not PYNPUT_AVAILABLE:
+        log.warning("pynput not installed — hotkey toggle unavailable.")
+        return
+
+    def on_toggle():
+        state.tuya_ambient_enabled = not state.tuya_ambient_enabled
+        status = "ON" if state.tuya_ambient_enabled else "OFF"
+        log.info("Tuya ambient toggled: %s (Ctrl+Shift+L)", status)
+
+    hotkeys = pynput_keyboard.GlobalHotKeys({
+        "<ctrl>+<shift>+l": on_toggle,
+    })
+    hotkeys.start()
+    log.info("Tuya hotkey registered: Ctrl+Shift+L to toggle ambient control.")
+
+
+# -----------------------------------------------------------------------
+# Screen color sampler
+# -----------------------------------------------------------------------
+class ScreenColorSampler:
+    """
+    Grabs a downscaled screen frame and returns the average color of
+    all non-dark pixels.
+    """
+
+    def __init__(self) -> None:
+        self._camera = None
+        self._sct = None
+        self._monitor = None
+
+    def start(self) -> bool:
+        if _USE_DXCAM:
+            try:
+                self._camera = dxcam.create(output_color="BGR")
+                log.info("Tuya sampler using dxcam.")
+                return True
+            except Exception as exc:
+                log.warning("dxcam failed for Tuya sampler: %s. Trying mss.", exc)
+
+        try:
+            self._sct = mss_mod.mss()
+            self._monitor = self._sct.monitors[1]
+            log.info("Tuya sampler using mss.")
+            return True
+        except Exception as exc:
+            log.error("Screen sampler init failed: %s", exc)
+            return False
+
+    def stop(self) -> None:
+        self._camera = None
+        self._sct = None
+
+    def sample(self) -> Optional[RGB]:
+        """
+        Capture frame, filter dark pixels, return average RGB.
+        Returns None if no bright pixels found or capture fails.
+        """
+        frame = self._grab()
+        if frame is None:
+            return None
+
+        # Downscale to tiny size for fast processing (30x17 ≈ 510 pixels)
+        try:
+            # Simple block downscale using numpy reshape + mean
+            h, w = frame.shape[:2]
+            # Resize to ~320x180 using slicing
+            small = frame[::h // 18, ::w // 32, :3]  # roughly 18x32 samples
+        except Exception:
+            small = frame[:, :, :3]
+
+        # Flatten to (N, 3) — BGR
+        pixels = small.reshape(-1, 3).astype(np.float32)
+
+        # Compute per-pixel brightness (simple average of channels)
+        brightness = pixels.mean(axis=1)
+
+        # Filter out dark pixels
+        bright_mask = brightness > _DARK_THRESHOLD
+        bright_pixels = pixels[bright_mask]
+
+        if len(bright_pixels) < 10:
+            # Not enough bright pixels — screen is mostly dark
+            return None
+
+        # Average remaining pixels
+        avg = bright_pixels.mean(axis=0)  # BGR
+        r, g, b = int(avg[2]), int(avg[1]), int(avg[0])  # BGR -> RGB
+
+        return (r, g, b)
+
+    def _grab(self) -> Optional[np.ndarray]:
+        if _USE_DXCAM and self._camera:
+            try:
+                return self._camera.grab()
+            except Exception:
+                return None
+        elif self._sct:
+            try:
+                raw = self._sct.grab(self._monitor)
+                return np.array(raw, dtype=np.uint8)
+            except Exception:
+                return None
+        return None
+
+
+# -----------------------------------------------------------------------
+# Tuya bulb controller
+# -----------------------------------------------------------------------
 def _ease_in_out(t: float) -> float:
-    """Smooth ease-in-out curve: t in [0,1] -> smoothed [0,1]."""
     return t * t * (3.0 - 2.0 * t)
 
 
 def _lerp_rgb(a: RGB, b: RGB, t: float) -> RGB:
-    """Linearly interpolate between two RGB colors."""
     return (
         int(a[0] + (b[0] - a[0]) * t),
         int(a[1] + (b[1] - a[1]) * t),
@@ -50,32 +197,33 @@ def _lerp_rgb(a: RGB, b: RGB, t: float) -> RGB:
     )
 
 
-class TuyaBulbController:
+def _rgb_to_brightness(rgb: RGB) -> int:
     """
-    Controls the Tuya ceiling bulb with smooth color crossfades.
+    Map the average brightness of an RGB color to a bulb brightness %.
+    Clamps between MIN and MAX to keep room usable.
+    """
+    avg = (rgb[0] + rgb[1] + rgb[2]) / 3.0 / 255.0
+    bri = _MIN_BRIGHTNESS_PCT + avg * (_MAX_BRIGHTNESS_PCT - _MIN_BRIGHTNESS_PCT)
+    return int(max(_MIN_BRIGHTNESS_PCT, min(_MAX_BRIGHTNESS_PCT, bri)))
 
-    Crossfades run in asyncio.to_thread() so they don't block the event loop.
-    Only one crossfade runs at a time — starting a new one cancels the previous.
-    """
+
+class TuyaBulbController:
+    """Controls the Tuya ceiling bulb with smooth crossfades."""
 
     def __init__(self) -> None:
         self._device = None
-        self._current_rgb: RGB = (255, 200, 120)
-        self._current_bri: int = 60
-        self._transition_task: asyncio.Task = None
+        self._current_rgb: RGB = _NEUTRAL_RGB
+        self._current_bri: int = _NEUTRAL_BRI
         self._connected = False
+        self._transition_task: Optional[asyncio.Task] = None
 
-    def _connect(self) -> bool:
-        """Connect to the Tuya bulb. Returns True on success."""
+    def connect(self) -> bool:
         if not TINYTUYA_AVAILABLE:
             log.error("tinytuya not installed. Run: pip install tinytuya")
             return False
-
         if not all([config.TUYA_DEVICE_ID, config.TUYA_LOCAL_KEY, config.TUYA_IP]):
-            log.error("Tuya credentials not set in .env "
-                      "(TUYA_DEVICE_ID, TUYA_LOCAL_KEY, TUYA_IP).")
+            log.error("Tuya credentials missing in .env.")
             return False
-
         try:
             self._device = tinytuya.BulbDevice(
                 dev_id=config.TUYA_DEVICE_ID,
@@ -83,7 +231,7 @@ class TuyaBulbController:
                 local_key=config.TUYA_LOCAL_KEY,
             )
             self._device.set_version(config.TUYA_VERSION)
-            self._device.set_socketPersistent(True)  # Keep TCP socket open
+            self._device.set_socketPersistent(True)
             self._connected = True
             log.info("Tuya bulb connected at %s.", config.TUYA_IP)
             return True
@@ -92,10 +240,7 @@ class TuyaBulbController:
             return False
 
     def _sync_set_color(self, rgb: RGB, brightness_pct: int) -> None:
-        """
-        Blocking: send color+brightness to the Tuya bulb.
-        Called via asyncio.to_thread().
-        """
+        """Blocking: send color + brightness to the bulb."""
         if not self._device:
             return
         try:
@@ -110,15 +255,10 @@ class TuyaBulbController:
         self,
         target_rgb: RGB,
         target_bri: int,
-        duration: float = config.TUYA_CROSSFADE_DURATION,
-        steps: int = config.TUYA_CROSSFADE_STEPS,
+        duration: float = _CROSSFADE_DURATION,
     ) -> None:
-        """
-        Smoothly crossfade to target_rgb over ``duration`` seconds.
-
-        Cancels any in-progress crossfade before starting.
-        """
-        # Cancel ongoing transition
+        """Smooth crossfade to target_rgb over duration seconds."""
+        # Cancel any in-progress fade
         if self._transition_task and not self._transition_task.done():
             self._transition_task.cancel()
             try:
@@ -128,18 +268,16 @@ class TuyaBulbController:
 
         start_rgb = self._current_rgb
         start_bri = self._current_bri
-        delay = duration / steps
+        delay = duration / _CROSSFADE_STEPS
 
         async def _worker() -> None:
-            for i in range(1, steps + 1):
-                t = _ease_in_out(i / steps)
+            for i in range(1, _CROSSFADE_STEPS + 1):
+                t = _ease_in_out(i / _CROSSFADE_STEPS)
                 curr_rgb = _lerp_rgb(start_rgb, target_rgb, t)
                 curr_bri = int(start_bri + (target_bri - start_bri) * t)
-
                 await asyncio.to_thread(self._sync_set_color, curr_rgb, curr_bri)
                 await asyncio.sleep(delay)
 
-            # Store final state
             self._current_rgb = target_rgb
             self._current_bri = target_bri
 
@@ -149,61 +287,88 @@ class TuyaBulbController:
         except asyncio.CancelledError:
             pass
 
-    async def apply_context(self, ctx: AppContext) -> None:
-        """Look up the color for ``ctx`` in config and crossfade to it."""
-        ctx_name = ctx.name.lower()
-        cfg = config.TUYA_CONTEXT_MAP.get(ctx_name)
-        if cfg is None:
-            log.warning("No Tuya color defined for context '%s'.", ctx_name)
-            return
 
-        target_rgb: RGB = cfg["rgb"]
-        target_bri: int = cfg["brightness"]
-        log.info("Tuya: context=%s -> rgb=%s bri=%d%%",
-                 ctx_name, target_rgb, target_bri)
-        await self.transition_to(target_rgb, target_bri)
-
-
+# -----------------------------------------------------------------------
+# Module entry point
+# -----------------------------------------------------------------------
 async def run() -> None:
     """
-    Main Tuya task: watch for context changes and crossfade accordingly.
+    Main Tuya ambient task:
+      - Samples screen color every 0.5s
+      - Crossfades bulb to match over 2s
+      - Responds to Ctrl+Shift+L toggle
     """
     if not TINYTUYA_AVAILABLE:
         log.error("tinytuya not available — Tuya ambient disabled.")
         return
 
-    ctrl = TuyaBulbController()
+    # Start hotkey listener in background
+    _start_hotkey_listener()
 
-    # Try to connect (retry on failure)
+    # Init screen sampler
+    sampler = ScreenColorSampler()
+    sampler_ok = await asyncio.to_thread(sampler.start)
+    if not sampler_ok:
+        log.warning("Screen sampler unavailable — using neutral color only.")
+
+    # Connect to Tuya bulb (retry until success)
+    ctrl = TuyaBulbController()
     connected = False
     while not state.shutdown_event.is_set() and not connected:
-        connected = await asyncio.to_thread(ctrl._connect)
+        connected = await asyncio.to_thread(ctrl.connect)
         if not connected:
-            log.warning("Tuya: retrying connection in 10s...")
+            log.warning("Tuya: retrying in 10s...")
             await asyncio.sleep(10.0)
 
     if not connected:
-        log.error("Tuya: giving up — check credentials in .env.")
         return
 
-    # Apply initial idle color
-    await ctrl.apply_context(AppContext.IDLE)
+    # Start at neutral
+    await ctrl.transition_to(_NEUTRAL_RGB, _NEUTRAL_BRI)
 
-    last_context = state.context
-
-    log.info("Tuya ambient monitor running.")
+    last_color: RGB = _NEUTRAL_RGB
+    last_enabled: bool = True
+    log.info("Tuya ambient running. Ctrl+Shift+L to toggle.")
 
     while not state.shutdown_event.is_set():
-        await asyncio.sleep(0.5)  # Poll context every 500ms
+        await asyncio.sleep(_SAMPLE_INTERVAL)
 
-        current_context = state.context
-        if current_context != last_context:
-            last_context = current_context
-            await ctrl.apply_context(current_context)
+        enabled = state.tuya_ambient_enabled
 
-        # Reconnect if connection dropped
+        # Toggled OFF: fade back to neutral and leave it there
+        if not enabled:
+            if last_enabled:
+                log.info("Tuya ambient disabled — holding neutral.")
+                await ctrl.transition_to(_NEUTRAL_RGB, _NEUTRAL_BRI)
+            last_enabled = False
+            continue
+
+        last_enabled = True
+
+        # Toggled back ON: immediately sample and fade
+        if not sampler_ok:
+            continue
+
+        sampled = await asyncio.to_thread(sampler.sample)
+
+        if sampled is None:
+            # Screen is very dark — fade toward neutral gently
+            target = _NEUTRAL_RGB
+            target_bri = _MIN_BRIGHTNESS_PCT
+        else:
+            target = sampled
+            target_bri = _rgb_to_brightness(sampled)
+
+        # Only update if color changed meaningfully (avoid spamming Tuya)
+        delta = sum(abs(target[i] - last_color[i]) for i in range(3))
+        if delta > 15:  # threshold to avoid constant micro-updates
+            asyncio.create_task(ctrl.transition_to(target, target_bri))
+            last_color = target
+
+        # Reconnect if dropped
         if not ctrl._connected:
             log.warning("Tuya: lost connection, reconnecting...")
-            await asyncio.to_thread(ctrl._connect)
+            await asyncio.to_thread(ctrl.connect)
 
+    await asyncio.to_thread(sampler.stop)
     log.info("Tuya ambient stopped.")
