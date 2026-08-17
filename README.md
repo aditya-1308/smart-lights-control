@@ -1,186 +1,125 @@
-# RoomLights
+# RoomLights 💡
 
-A lightweight Python background app that intelligently controls your WLED LED strip and Tuya ceiling bulb based on game telemetry, a virtual DS4 controller lightbar, and screen sync.
-
-## What It Does
-
-| Situation | Seg 1 + Seg 2 (lightbar) | Seg 3 (wall) | Ceiling |
-|---|---|---|---|
-| Idle / desktop | Off | Off | Warm white |
-| GTA V (wanted level) | Red/blue flash from DS4 | Off | Adapts |
-| AC + CSP (driving) | Green→yellow→red→blue shift lights | Off | Warm amber |
-| F1 23/24 (driving) | Rev meter fill (telemetry) | Off | Warm amber |
-| CS2 (flashbang) | All white 2s, then restore | Off | Dark blue |
-| CS2 (health < 20) | Red breathing pulse | Off | Dark blue |
-| Pomodoro timer | Off | 6-LED countdown bar | Dim warm red |
-| Any other game | DS4 lightbar color (if supported) | Off | Adapts |
-
-## Hardware
-
-- **WLED ESP board** — 4 segments:
-  - Seg 0 (109 LEDs): Prismatik screen sync — untouched by this app
-  - Seg 1 (17 LEDs): Right half of lightbar (wired right→left)
-  - Seg 2 (18 LEDs): Left half of lightbar (wired left→right)
-  - Seg 3 (6 LEDs): Vertical strip on wall (top→bottom)
-- **Homemate / Tuya ceiling bulb** on local network
+A powerful, lightweight Python background app that turns your **WLED LED strip** and **Tuya ceiling light** into an interactive 360° room lighting ecosystem for PC gaming, movies, and desktop use.
 
 ---
 
-## One-Time Setup
+## 🌟 What RoomLights Does
 
-### 1. Install ViGEmBus Driver
+RoomLights controls **4 distinct hardware zones** synchronously:
 
-Required for the virtual DS4 controller (which captures lightbar colors from games).
+| Feature / Situation | Seg 0 (109 LEDs — Monitor Perimeter) | Seg 1 + 2 (35 LEDs — Lightbar) | Seg 3 (6 LEDs — Wall Strip) | Tuya Ceiling Light |
+|---|---|---|---|---|
+| **Desktop / Movies** | High-speed edge screen sync (**replaces Prismatik**) | Off / Standby | Off / Standby | Real-time screen color ambient (smooth 2s fade) |
+| **150+ Chroma PC Games** *(Cyberpunk 2077, Fortnite, Apex, etc.)* | Intercepts game RGB lighting over local port `54235` | In-game action colors | Off / Standby | Dynamic game ambience |
+| **Assetto Corsa** | Yellow/Blue/Black flags, track limit flashes, sector split timing sweeps | Progressive rev meter (green→yellow→red→blue flash) | Off / Standby | Warm racing ambience |
+| **F1 23 / F1 24** | **3D Proximity Spotter** (left/right car blind-spot alerts), flags, safety car amber | Rev meter fill (telemetry) | Off / Standby | Warm racing ambience |
+| **CS2 (Counter-Strike 2)** | Flashbang whiteout, C4 bomb timer flash, low health pulse | Flashbang 2s whiteout & red pulse | Off / Standby | Dark blue gaming ambience |
+| **FPS / Action Games** | **Smart ROI**: Detects directional damage blood splatters & illuminates that side | DS4 lightbar colors | Off / Standby | Dynamic game ambience |
+| **GTA V / Sony PC Ports** | Game RGB effects | DirectHID DualShock 4 lightbar colors (sirens, health) | Off / Standby | Dynamic game ambience |
+| **Pomodoro Timer** | Active background mode | Active background mode | 25-min countdown bar | Dim focus red |
 
-1. Download from: https://github.com/nefarius/ViGEmBus/releases
-2. Run the installer (one click, requires reboot)
+---
 
-### 2. Configure Prismatik
+## 🛠️ Hardware & Layout Setup
 
-Prismatik handles your main 109-LED strip (Seg 0). No changes needed — it keeps pointing at your WLED IP as normal.
+RoomLights assumes your WLED strip is configured into 4 segments:
 
-### 3. Disable Steam Input for DirectHID Games
+- **Seg 0 (109 LEDs)**: Full perimeter around your monitor (starts bottom-middle, going clockwise: 18 bottom-right, 18 right, 36 top, 18 left, 19 bottom-left).
+- **Seg 1 (17 LEDs)**: Right half of your controller lightbar (wired R→L).
+- **Seg 2 (18 LEDs)**: Left half of your controller lightbar (wired L→R).
+- **Seg 3 (6 LEDs)**: Vertical wall strip (top→bottom).
+- **Tuya / Homemate Ceiling Bulb**: Local smart bulb on your Wi-Fi network.
 
-For GTA V, Assetto Corsa (with CSP), and other Sony PC ports:
+---
 
-1. Open Steam → Library → right-click the game → Properties
-2. Go to **Controller** tab
-3. Set to **Disable Steam Input**
+## ⌨️ Customizable Hotkeys
 
-This lets the game write lightbar data directly to our virtual DS4.
+You can control the room ambience on the fly using keyboard shortcuts. Hotkeys are completely customizable in your `.env` file!
 
-### 4. CS2 Game State Integration
+| Shortcut (Default) | Function |
+|---|---|
+| `Ctrl + Shift + L` | Toggle Tuya ceiling light room ambient control ON / OFF |
+| `Ctrl + Shift + Up` | Increase Tuya ceiling light brightness by 1% (Instant response) |
+| `Ctrl + Shift + Down` | Decrease Tuya ceiling light brightness by 1% (Instant response) |
 
-Drop the provided config file into your CS2 game folder:
+---
 
+## 🚀 Quick Setup Guide (Beginner Friendly)
+
+### Step 1: Install ViGEmBus Driver (For Controller Lightbar)
+Required for games like GTA V and Assetto Corsa to send controller lightbar colors to Python.
+1. Download from: [ViGEmBus Releases](https://github.com/nefarius/ViGEmBus/releases)
+2. Run the installer and restart your PC.
+
+### Step 2: Disable Steam Input (For DirectHID Games)
+1. Open Steam → Right-click your game (e.g. GTA V or Assetto Corsa) → **Properties**.
+2. Click **Controller** tab → Set to **Disable Steam Input**.
+
+### Step 3: CS2 Game State Integration (Optional)
+Copy the file `gamestate_integration_roomlights.cfg` from this repository into your CS2 cfg folder:
 ```
-gamestate_integration_roomlights.cfg
-→ <Steam>\steamapps\common\Counter-Strike Global Offensive\game\csgo\cfg\
+<Steam>\steamapps\common\Counter-Strike Global Offensive\game\csgo\cfg\
 ```
 
-CS2 will automatically start sending game state to `http://127.0.0.1:3000/cs2`.
-
-### 5. Get Your Tuya Local Key
-
+### Step 4: Extract Your Tuya Bulb Local Key
 ```bash
 pip install tinytuya
 python -m tinytuya wizard
 ```
+Follow the prompts to sign in with your Tuya developer account. It will print your `device_id`, `ip`, and `local_key`.
 
-Follow the prompts — it will discover your device and print its `device_id`, `ip`, and `local_key`. You need your Tuya Developer account credentials for the wizard.
+### Step 5: Configure `.env`
+1. Copy `.env.example` to `.env`:
+   ```bash
+   copy .env.example .env
+   ```
+2. Open `.env` in any text editor and fill in your IP addresses and keys:
+   ```env
+   WLED_IP=192.168.1.100
+   TUYA_DEVICE_ID=your_device_id_here
+   TUYA_LOCAL_KEY=your_16char_key_here
+   TUYA_IP=192.168.1.101
+   ```
 
-Alternatively, see the [tinytuya docs](https://github.com/jasonacox/tinytuya#setup-wizard---getting-local-keys).
-
-### 6. Configure .env
-
+### Step 6: Install Python Dependencies & Run
 ```bash
-cp .env.example .env
-```
+# Activate your virtual environment (if using one)
+.venv\Scripts\activate
 
-Edit `.env` and fill in your values:
-
-```env
-WLED_IP=192.168.1.100          # Your WLED board's IP
-TUYA_DEVICE_ID=abc123...       # From tinytuya wizard
-TUYA_LOCAL_KEY=1234567890abcdef # 16 characters
-TUYA_IP=192.168.1.101
-TUYA_VERSION=3.3
-```
-
-### 7. Install Python Dependencies
-
-```bash
-# Create a virtual environment (recommended)
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-
+# Install requirements
 pip install -r requirements.txt
-```
 
----
-
-## Running
-
-```bash
+# Start RoomLights
 python main.py
 ```
-
-Stop with **Ctrl+C**.
-
-You should see startup logs confirming each module:
-```
-12:00:00 [INFO] main: RoomLights starting up
-12:00:00 [INFO] dualsense: Virtual DS4 created via vgamepad.
-12:00:00 [INFO] dualsense: DS4 lightbar callback registered.
-12:00:00 [INFO] lightbar: Lightbar renderer started.
-12:00:00 [INFO] simracing: Sim racing module starting (SIM_GAME=AC).
-12:00:00 [INFO] cs2_gsi: CS2 GSI server listening on http://127.0.0.1:3000/cs2
-12:00:00 [INFO] tuya: Tuya bulb connected at 192.168.1.101.
-12:00:00 [INFO] main: All modules started. Press Ctrl+C to stop.
-```
+*(Make sure to close/quit Prismatik before running — RoomLights now handles Seg 0 screen capture natively!)*
 
 ---
 
-## Sim Racing Notes
+## 🏎️ Sim Racing Setup
 
-**Assetto Corsa with CSP (Custom Shaders Patch):**
-- CSP's Gamepad FX scripts write rev light colors directly to our virtual DS4 lightbar.
-- You'll see green→yellow→red→blue on Seg 1+2 automatically.
-- Make sure Steam Input is **disabled** for AC.
-
-**Assetto Corsa without CSP (base game):**
-- The app reads AC's shared memory directly.
-- Same visual result, internally computed.
-
-**F1 23 / F1 24:**
-- Set `SIM_GAME=F1` in `.env`.
-- The game broadcasts UDP telemetry on port 20777 (default).
-- Enable UDP telemetry in F1's game settings: `Telemetry → UDP On → Broadcast Mode`.
+- **Assetto Corsa with CSP (Custom Shaders Patch)**:
+  - Gamepad FX sends rev lights directly to Seg 1+2 automatically.
+  - Seg 0 shows flags, track limit warnings, and sector timing sweeps.
+- **F1 23 / F1 24**:
+  - Set `SIM_GAME=F1` in `.env`.
+  - Enable UDP telemetry in F1 settings: `Options → Telemetry Settings → UDP Telemetry: ON`, `UDP Port: 20777`, `UDP Format: 2023/2024`.
 
 ---
 
-## Tuning the Rev Meter
+## ❓ Frequently Asked Questions (FAQ) / Troubleshooting
 
-Edit these constants in `config.py` to match your preferred shift point:
-
-```python
-REV_START_PCT   = 0.28   # below this = dark
-REV_GREEN_PCT   = 0.50   # green tips fully lit
-REV_YELLOW_PCT  = 0.68   # approaching shift zone
-REV_FULL_PCT    = 0.82   # all lit = past optimal shift
-REV_LIMITER_PCT = 0.93   # blue flash (limiter)
-REV_FLASH_HZ    = 4      # flash speed
-```
-
-Higher `REV_LIMITER_PCT` = more warning time before limiter flash. Lower `REV_FULL_PCT` = strip fills up earlier (more aggressive).
-
----
-
-## Git Setup
-
-```bash
-git init
-git add .
-git commit -m "Initial commit: RoomLights telemetry controller"
-git remote add origin https://github.com/YOUR_USERNAME/RoomLights.git
-git push -u origin main
-```
-
----
-
-## Troubleshooting
-
-| Problem | Fix |
+| Issue | Solution |
 |---|---|
-| Virtual DS4 fails to start | Install ViGEmBus driver, reboot, try again |
-| Lightbar color never changes | Disable Steam Input for the game in Steam properties |
-| CS2 events not triggering | Check cfg file is in the right folder; verify token matches in .env |
-| Tuya not responding | Run `python -m tinytuya wizard` again to get fresh local key |
-| F1 UDP no data | Enable UDP telemetry in F1 settings → set port to 20777 |
-| AC shared memory not found | AC must be running (not just the launcher) |
+| **Virtual DS4 fails to start** | Ensure ViGEmBus driver is installed and reboot your PC. |
+| **Seg 0 screen capture is laggy** | Adjust `SCREEN_CAPTURE_FPS=24` in `.env`. `dxcam` hardware acceleration is enabled by default. |
+| **Chroma games aren't connecting** | Make sure Razer Synapse is **not** running (Synapse blocks port 54235). |
+| **Tuya ceiling light not responding** | Verify bulb IP in `.env` and run `python -m tinytuya wizard` to refresh local key. |
+| **How to stop the app** | Press `Ctrl + C` in the terminal window. |
 
 ---
 
-## License
+## 📜 License
 
-MIT — see [LICENSE](LICENSE).
+MIT License — free for personal and open-source use. See [LICENSE](LICENSE).
