@@ -1,5 +1,5 @@
 """
-mod_lightbar.py — Unified Seg 1 + Seg 2 lightbar state machine.
+mod_lightbar.py - Unified Seg 1 + Seg 2 lightbar state machine.
 
 This is the central rendering loop for the 35-LED logical bar.
 It reads state.lightbar_mode and dispatches to the appropriate renderer.
@@ -129,7 +129,7 @@ class LightbarRenderer:
         self._pulse_period = 1.5        # seconds for one breath cycle
 
     async def run(self) -> None:
-        """Main rendering loop — runs until shutdown."""
+        """Main rendering loop - runs until shutdown."""
         min_interval = 1.0 / config.LIGHTBAR_UPDATE_HZ
         log.info("Lightbar renderer started.")
 
@@ -143,7 +143,7 @@ class LightbarRenderer:
             if sleep_for > 0:
                 await asyncio.sleep(sleep_for)
 
-        # Shutdown — turn off both segments
+        # Shutdown - turn off both segments
         await self._wled.set_lightbar_off()
         log.info("Lightbar renderer stopped.")
 
@@ -178,7 +178,7 @@ class LightbarRenderer:
         """
         mode = state.lightbar_mode
 
-        # Don't override CS2 event modes here — they restore themselves
+        # Don't override CS2 event modes here - they restore themselves
         if mode in (LightbarMode.CS2_FLASH, LightbarMode.CS2_PULSE):
             return
 
@@ -200,7 +200,7 @@ class LightbarRenderer:
     # ------------------------------------------------------------------
 
     async def _render_cs2_flash(self) -> None:
-        """All-white flash — just hold white; restore is handled by gsi module."""
+        """All-white flash - just hold white; restore is handled by gsi module."""
         await self._wled.set_lightbar_solid(_WHITE)
 
     async def _render_cs2_pulse(self) -> None:

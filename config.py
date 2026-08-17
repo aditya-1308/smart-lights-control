@@ -1,8 +1,8 @@
 """
-config.py — Central configuration for RoomLights.
+config.py - Central configuration for RoomLights.
 
 Reads all settings from a .env file in the project root.
-Every other module imports from here — never reads os.environ directly.
+Every other module imports from here - never reads os.environ directly.
 """
 
 import os
@@ -47,12 +47,12 @@ WLED_IP: str = _get("WLED_IP", "192.168.1.100")
 WLED_PORT: int = 80  # HTTP API port (fixed by WLED firmware)
 WLED_BASE_URL: str = f"http://{WLED_IP}:{WLED_PORT}"
 WLED_STATE_URL: str = f"{WLED_BASE_URL}/json/state"
-WLED_TIMEOUT: float = 1.0  # seconds — silently drop on timeout
+WLED_TIMEOUT: float = 1.0  # seconds - silently drop on timeout
 
 # ---------------------------------------------------------------------------
-# Segment definitions — physical LED layout
+# Segment definitions - physical LED layout
 # ---------------------------------------------------------------------------
-# Seg 0: 109 LEDs — screen edge ambient / spatial game effects
+# Seg 0: 109 LEDs - screen edge ambient / spatial game effects
 #   Clockwise from bottom-middle:
 #   idx  0-17  : bottom-right (18 LEDs, center → right corner)
 #   idx 18-35  : right edge   (18 LEDs, bottom-right → top-right)
@@ -60,9 +60,9 @@ WLED_TIMEOUT: float = 1.0  # seconds — silently drop on timeout
 #   idx 72-89  : left edge    (18 LEDs, top-left → bottom-left)
 #   idx 90-108 : bottom-left  (19 LEDs, bottom-left → center)
 #
-# Seg 1:  17 LEDs — right half of lightbar (runs R→L, idx 0 = far right)
-# Seg 2:  18 LEDs — left half of lightbar  (runs L→R, idx 0 = far left)
-# Seg 3:   6 LEDs — Pomodoro bar (vertical on wall, top→bottom)
+# Seg 1:  17 LEDs - right half of lightbar (runs R→L, idx 0 = far right)
+# Seg 2:  18 LEDs - left half of lightbar  (runs L→R, idx 0 = far left)
+# Seg 3:   6 LEDs - Pomodoro bar (vertical on wall, top→bottom)
 #
 # Seg 1 + Seg 2 = one unified 35-LED logical bar.
 SEG0_ID: int = 0
@@ -96,13 +96,13 @@ CS2_GSI_PORT: int = _int("CS2_GSI_PORT", 3000)
 CS2_GSI_TOKEN: str = _get("CS2_GSI_TOKEN", "roomlights_secret_token_123")
 
 # ===================================================================
-# Sim Racing (rev meter fallback when DS4 lightbar is unavailable)
+# Sim Racing (Auto-detects Assetto Corsa & F1 23/24)
 # ===================================================================
-SIM_GAME: str = _get("SIM_GAME", "AC").upper()  # "AC" or "F1"
 F1_UDP_PORT: int = _int("F1_UDP_PORT", 20777)
 
+
 # ---------------------------------------------------------------------------
-# Rev meter thresholds — tune per car / preference
+# Rev meter thresholds - tune per car / preference
 # ---------------------------------------------------------------------------
 REV_START_PCT: float = 0.28    # below this = dark (no indication)
 REV_GREEN_PCT: float = 0.50    # green tips fully lit

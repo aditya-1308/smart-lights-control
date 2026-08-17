@@ -1,5 +1,5 @@
 """
-mod_screen_capture.py — Screen edge ambient capture for Seg 0.
+mod_screen_capture.py - Screen edge ambient capture for Seg 0.
 
 Replaces Prismatik. Captures screen edges and computes average colors per
 LED zone, then writes to state.seg0_colors.

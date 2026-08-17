@@ -1,5 +1,5 @@
 """
-wled_api.py — Async HTTP wrapper for the WLED JSON API.
+wled_api.py - Async HTTP wrapper for the WLED JSON API.
 
 Features:
   - Persistent ``aiohttp.ClientSession`` with connection pooling.
@@ -84,7 +84,7 @@ class WLEDClient:
                 log.warning("WLED responded %d", resp.status)
                 return False
         except asyncio.TimeoutError:
-            # Expected when WLED is busy — silently drop
+            # Expected when WLED is busy - silently drop
             return False
         except aiohttp.ClientError as exc:
             log.debug("WLED connection error: %s", exc)
@@ -125,7 +125,7 @@ class WLEDClient:
             "seg": [{
                 "id": seg_id,
                 "on": True,
-                "fx": 0,    # Solid — "i" array overrides per-LED
+                "fx": 0,    # Solid - "i" array overrides per-LED
                 "i": i_array,
             }]
         })
@@ -183,7 +183,7 @@ class WLEDClient:
         seg2_colors = color_array[:config.SEG2_COUNT]           # 0..17 → Seg 2
         seg1_colors = color_array[config.SEG2_COUNT:][::-1]     # 18..34 → reversed for Seg 1
 
-        # Build "i" arrays — one color per LED
+        # Build "i" arrays - one color per LED
         seg2_i = _build_per_led_i_array(seg2_colors)
         seg1_i = _build_per_led_i_array(seg1_colors)
 

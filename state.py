@@ -1,10 +1,10 @@
 """
-state.py — Thread-safe shared state for RoomLights.
+state.py - Thread-safe shared state for RoomLights.
 
 All modules read/write through this singleton. Uses asyncio.Lock for coroutine
 safety and threading.Lock for the DS4 callback thread.
 
-Never import os.environ or config values directly in modules — read state here.
+Never import os.environ or config values directly in modules - read state here.
 """
 
 import asyncio
@@ -16,7 +16,7 @@ from typing import List, Optional, Tuple
 
 class LightbarMode(Enum):
     """Current operating mode for the unified Seg 1 + Seg 2 lightbar."""
-    IDLE = auto()          # no game active — segs off or dim
+    IDLE = auto()          # no game active - segs off or dim
     DS4_ACTIVE = auto()    # DS4 lightbar data is being received
     REV_METER = auto()     # telemetry-driven rev meter (fallback)
     CS2_FLASH = auto()     # all-white flash event (2 seconds)
@@ -34,7 +34,7 @@ class AppContext(Enum):
 
 class Seg0Source(Enum):
     """Who currently owns Seg 0 (109 LEDs)."""
-    SCREEN_CAPTURE = auto()   # Default — screen edge ambient
+    SCREEN_CAPTURE = auto()   # Default - screen edge ambient
     CHROMA = auto()           # Chroma game RGB data active
     AC_SPATIAL = auto()       # Assetto Corsa spatial telemetry
     F1_SPATIAL = auto()       # F1 23/24 spatial telemetry
@@ -98,7 +98,7 @@ class SharedState:
         self.shutdown_event: asyncio.Event = asyncio.Event()
 
     # -----------------------------------------------------------------
-    # DS4 lightbar — called from a non-asyncio thread (ViGEm callback)
+    # DS4 lightbar - called from a non-asyncio thread (ViGEm callback)
     # -----------------------------------------------------------------
     def set_lightbar_rgb(self, r: int, g: int, b: int) -> None:
         """Set lightbar color from the DS4 callback thread (thread-safe)."""
@@ -126,7 +126,7 @@ class SharedState:
         return (r + g + b) > 0
 
     # -----------------------------------------------------------------
-    # CS2 flash — save/restore previous mode
+    # CS2 flash - save/restore previous mode
     # -----------------------------------------------------------------
     async def enter_cs2_flash(self) -> None:
         """Enter CS2 white-flash mode, saving the current lightbar mode."""
@@ -167,6 +167,6 @@ class SharedState:
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton — import ``state`` from anywhere.
+# Module-level singleton - import ``state`` from anywhere.
 # ---------------------------------------------------------------------------
 state = SharedState()

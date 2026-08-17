@@ -1,5 +1,5 @@
 """
-mod_e_tuya.py — Ambient ceiling light driven by live screen color.
+mod_e_tuya.py - Ambient ceiling light driven by live screen color.
 
 Samples the average color of your screen every 0.5 seconds and smoothly
 crossfades the Tuya ceiling bulb to match, creating a cinematic ambient
@@ -80,7 +80,7 @@ def _start_hotkey_listener() -> None:
       KEYBIND_TUYA_BRIGHTNESS_DOWN  : brightness -1% (min 1%)
     """
     if not PYNPUT_AVAILABLE:
-        log.warning("pynput not installed — hotkeys unavailable.")
+        log.warning("pynput not installed - hotkeys unavailable.")
         return
 
     def on_toggle():
@@ -169,7 +169,7 @@ class ScreenColorSampler:
         except Exception:
             small = frame[:, :, :3]
 
-        # Flatten to (N, 3) — BGR
+        # Flatten to (N, 3) - BGR
         pixels = small.reshape(-1, 3).astype(np.float32)
 
         # Compute per-pixel brightness (simple average of channels)
@@ -180,7 +180,7 @@ class ScreenColorSampler:
         bright_pixels = pixels[bright_mask]
 
         if len(bright_pixels) < 10:
-            # Not enough bright pixels — screen is mostly dark
+            # Not enough bright pixels - screen is mostly dark
             return None
 
         # Average remaining pixels
@@ -343,7 +343,7 @@ async def run() -> None:
       - Responds to Ctrl+Shift+L toggle
     """
     if not TINYTUYA_AVAILABLE:
-        log.error("tinytuya not available — Tuya ambient disabled.")
+        log.error("tinytuya not available - Tuya ambient disabled.")
         return
 
     # Start hotkey listener in background
@@ -353,7 +353,7 @@ async def run() -> None:
     sampler = ScreenColorSampler()
     sampler_ok = await asyncio.to_thread(sampler.start)
     if not sampler_ok:
-        log.warning("Screen sampler unavailable — using neutral color only.")
+        log.warning("Screen sampler unavailable - using neutral color only.")
 
     # Connect to Tuya bulb (retry until success)
     ctrl = TuyaBulbController()
@@ -382,7 +382,7 @@ async def run() -> None:
         # Toggled OFF: fade back to neutral and leave it there
         if not enabled:
             if last_enabled:
-                log.info("Tuya ambient disabled — holding neutral.")
+                log.info("Tuya ambient disabled - holding neutral.")
                 await ctrl.transition_to(_NEUTRAL_RGB, _NEUTRAL_BRI)
             last_enabled = False
             continue
@@ -396,7 +396,7 @@ async def run() -> None:
         sampled = await asyncio.to_thread(sampler.sample)
 
         if sampled is None:
-            # Screen is very dark — dim to minimum but keep current hue
+            # Screen is very dark - dim to minimum but keep current hue
             target = last_color
             target_bri = 1
         else:
@@ -408,11 +408,11 @@ async def run() -> None:
         color_delta = sum(abs(target[i] - last_color[i]) for i in range(3))
 
         if color_delta > 15:
-            # Color changed — smooth crossfade
+            # Color changed - smooth crossfade
             asyncio.create_task(ctrl.transition_to(target, target_bri))
             last_color = target
         elif bri_delta >= 1:
-            # Brightness-only change — instant, no fade
+            # Brightness-only change - instant, no fade
             asyncio.create_task(ctrl.set_brightness_instant(target_bri))
 
         # Reconnect if dropped

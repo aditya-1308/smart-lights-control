@@ -1,5 +1,5 @@
 """
-mod_dualsense.py — Virtual DS4 controller + lightbar interception.
+mod_dualsense.py - Virtual DS4 controller + lightbar interception.
 
 Creates a virtual DualShock 4 controller via ViGEmBus so that games send
 lightbar RGB data to it. Uses ctypes to hook ViGEmClient.dll directly for
@@ -15,12 +15,12 @@ How it works:
   4. mod_lightbar.py reads state and applies to Seg 1 + Seg 2.
 
 Game compatibility:
-  GTA V:       Steam Input OFF — native DirectHID lightbar.
-  AC + CSP:    Steam Input OFF — CSP Gamepad FX writes HID directly.
-  F1 23/24:    NO lightbar — falls back to rev meter in mod_a_simracing.py.
-  CS2:         NO lightbar — handled by mod_b_cs2_gsi.py.
-  Cyberpunk:   Steam Input OFF — native DirectHID.
-  Sony ports:  Steam Input OFF — native DirectHID.
+  GTA V:       Steam Input OFF - native DirectHID lightbar.
+  AC + CSP:    Steam Input OFF - CSP Gamepad FX writes HID directly.
+  F1 23/24:    NO lightbar - falls back to rev meter in mod_a_simracing.py.
+  CS2:         NO lightbar - handled by mod_b_cs2_gsi.py.
+  Cyberpunk:   Steam Input OFF - native DirectHID.
+  Sony ports:  Steam Input OFF - native DirectHID.
 
 Prerequisite: ViGEmBus driver installed.
   https://github.com/nefarius/ViGEmBus/releases
@@ -220,7 +220,7 @@ class VirtualDS4Controller:
         log.info("Virtual DS4 stopped.")
 
     # ------------------------------------------------------------------
-    # ViGEm callback — called from Win32 thread pool, NOT asyncio thread
+    # ViGEm callback - called from Win32 thread pool, NOT asyncio thread
     # ------------------------------------------------------------------
     def _on_ds4_notification(
         self,
@@ -245,7 +245,7 @@ class VirtualDS4Controller:
 
 
 # ---------------------------------------------------------------------------
-# Module entry point — called from main.py
+# Module entry point - called from main.py
 # ---------------------------------------------------------------------------
 async def run(controller: VirtualDS4Controller) -> None:
     """

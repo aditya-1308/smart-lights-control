@@ -1,5 +1,5 @@
 """
-mod_chroma_bridge.py — Razer Chroma SDK REST API bridge.
+mod_chroma_bridge.py - Razer Chroma SDK REST API bridge.
 
 Hosts a local HTTP server on port 54235 that emulates the Razer Chroma
 REST API. When a Chroma-enabled game launches, it connects to our server
@@ -148,7 +148,7 @@ def _keyboard_grid_to_seg0(grid: List[List[int]]) -> List[RGB]:
 # -----------------------------------------------------------------------
 
 async def _handle_init(request: web.Request) -> web.Response:
-    """POST /razer/chromasdk — Game registers a Chroma session."""
+    """POST /razer/chromasdk - Game registers a Chroma session."""
     global _session_active, _session_id, _last_heartbeat
 
     try:
@@ -176,7 +176,7 @@ async def _handle_init(request: web.Request) -> web.Response:
 
 
 async def _handle_heartbeat(request: web.Request) -> web.Response:
-    """PUT /chromasdk/heartbeat — Game keeps session alive."""
+    """PUT /chromasdk/heartbeat - Game keeps session alive."""
     global _last_heartbeat
     _last_heartbeat = time.monotonic()
     state.chroma_last_heartbeat = _last_heartbeat
@@ -184,7 +184,7 @@ async def _handle_heartbeat(request: web.Request) -> web.Response:
 
 
 async def _handle_keyboard(request: web.Request) -> web.Response:
-    """PUT/POST /chromasdk/keyboard — Receive keyboard color grid."""
+    """PUT/POST /chromasdk/keyboard - Receive keyboard color grid."""
     global _last_heartbeat
     _last_heartbeat = time.monotonic()
 
@@ -211,24 +211,24 @@ async def _handle_keyboard(request: web.Request) -> web.Response:
 
 
 async def _handle_mouse(request: web.Request) -> web.Response:
-    """PUT/POST /chromasdk/mouse — Acknowledge but ignore."""
+    """PUT/POST /chromasdk/mouse - Acknowledge but ignore."""
     global _last_heartbeat
     _last_heartbeat = time.monotonic()
     return web.json_response({"result": 0})
 
 
 async def _handle_mousepad(request: web.Request) -> web.Response:
-    """PUT/POST /chromasdk/mousepad — Acknowledge but ignore."""
+    """PUT/POST /chromasdk/mousepad - Acknowledge but ignore."""
     return web.json_response({"result": 0})
 
 
 async def _handle_chromalink(request: web.Request) -> web.Response:
-    """PUT/POST /chromasdk/chromalink — Acknowledge but ignore."""
+    """PUT/POST /chromasdk/chromalink - Acknowledge but ignore."""
     return web.json_response({"result": 0})
 
 
 async def _handle_delete_session(request: web.Request) -> web.Response:
-    """DELETE /chromasdk — Game disconnects."""
+    """DELETE /chromasdk - Game disconnects."""
     global _session_active
     log.info("Chroma game disconnected.")
     _session_active = False

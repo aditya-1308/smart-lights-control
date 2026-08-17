@@ -1,5 +1,5 @@
 """
-mod_smart_roi.py — Smart Region of Interest screen analysis.
+mod_smart_roi.py - Smart Region of Interest screen analysis.
 
 Captures specific screen regions to detect game events without telemetry:
   1. Directional Damage Detection:

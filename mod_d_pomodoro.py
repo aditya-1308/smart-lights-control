@@ -1,5 +1,5 @@
 """
-mod_d_pomodoro.py — 25-minute Pomodoro timer on Seg 3.
+mod_d_pomodoro.py - 25-minute Pomodoro timer on Seg 3.
 
 Seg 3 (WLED ID 3, 6 LEDs, vertical on wall, top-to-bottom) shows WLED's
 built-in 'Percent' effect (fx: 98). The effect renders a lit bar that
@@ -95,7 +95,7 @@ async def run(wled: WLEDClient) -> None:
                 )
                 break  # Shutdown triggered
             except asyncio.TimeoutError:
-                pass   # Normal — keep going
+                pass   # Normal - keep going
 
     # Timer finished or shutdown
     state.pomodoro_active = False

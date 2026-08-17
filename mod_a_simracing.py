@@ -1,18 +1,18 @@
 """
-mod_a_simracing.py — Sim racing telemetry reader (rev meter fallback).
+mod_a_simracing.py - Sim racing telemetry reader (rev meter fallback).
 
 Only active when DS4 lightbar data is NOT being received (state.is_ds4_active()
 returns False). Provides RPM percentage to the lightbar state machine.
 
 Two data sources (selected by SIM_GAME in .env):
 
-  AC  — Assetto Corsa Windows Shared Memory
+  AC  - Assetto Corsa Windows Shared Memory
         Reads Local\\acpmf_physics and Local\\acpmf_static via mmap + ctypes.
         No network, zero latency, works without any game mods.
         Note: AC + CSP will send lightbar data via the DS4 callback instead,
         making this module dormant. This path handles base AC (no CSP).
 
-  F1  — F1 23/24 UDP telemetry
+  F1  - F1 23/24 UDP telemetry
         Binds a UDP socket on F1_UDP_PORT (default 20777).
         Parses Packet ID 6 (Car Telemetry) for revLightsPercent (0-100).
 
@@ -34,7 +34,7 @@ from state import state, LightbarMode
 
 log = logging.getLogger("simracing")
 
-# Update cap — don't hammer state faster than necessary
+# Update cap - don't hammer state faster than necessary
 _UPDATE_INTERVAL = 1.0 / 30  # 30 Hz
 
 
@@ -129,7 +129,7 @@ class ACSharedMemoryReader:
             log.info("Assetto Corsa shared memory opened.")
             return True
         except OSError:
-            # AC not running — shared memory doesn't exist yet
+            # AC not running - shared memory doesn't exist yet
             return False
 
     def disconnect(self) -> None:
@@ -175,7 +175,7 @@ class ACSharedMemoryReader:
 _F1_HEADER_FMT = "<HBBBBBQfIIBB"
 _F1_HEADER_SIZE = struct.calcsize(_F1_HEADER_FMT)
 
-# Car telemetry data per car (partial — just the fields we need)
+# Car telemetry data per car (partial - just the fields we need)
 # speed(H) throttle(f) steer(f) brake(f) clutch(B) gear(b)
 # engineRPM(H) drs(B) revLightsPercent(B)
 _F1_CAR_TELEM_FMT = "<HfffBbHBB"
@@ -253,20 +253,19 @@ class F1UDPReader:
 
 async def run() -> None:
     """
-    Async task: continuously update state.rpm_pct from game telemetry.
+    Async task: automatically detect active sim game (AC or F1) and update state.rpm_pct.
 
-    Automatically reconnects if the game closes and reopens.
+    Boots both Assetto Corsa shared memory reader and F1 UDP reader in parallel.
+    Whichever game is running will update state.rpm_pct.
     Dormant (returns immediately) if DS4 lightbar data is active.
     """
-    game = config.SIM_GAME.upper()
-    log.info("Sim racing module starting (SIM_GAME=%s).", game)
+    log.info("Sim racing telemetry module starting (auto-detecting AC & F1)...")
+    await asyncio.gather(
+        _run_ac(),
+        _run_f1(),
+        return_exceptions=True,
+    )
 
-    if game == "AC":
-        await _run_ac()
-    elif game == "F1":
-        await _run_f1()
-    else:
-        log.error("Unknown SIM_GAME '%s'. Set to 'AC' or 'F1' in .env.", game)
 
 
 async def _run_ac() -> None:
@@ -280,7 +279,7 @@ async def _run_ac() -> None:
         if not connected:
             connected = await asyncio.to_thread(reader.connect)
             if not connected:
-                # AC not running yet — check again in 3s
+                # AC not running yet - check again in 3s
                 await asyncio.sleep(3.0)
                 continue
 
@@ -296,7 +295,7 @@ async def _run_ac() -> None:
 
         pct = await asyncio.to_thread(reader.read_rpm_pct)
         if pct is None:
-            # Shared memory gone — AC probably closed
+            # Shared memory gone - AC probably closed
             reader.disconnect()
             connected = False
             state.rpm_pct = 0.0
@@ -335,7 +334,7 @@ async def _run_f1() -> None:
             state.rpm_pct = pct
             last_update = time.monotonic()
         else:
-            await asyncio.sleep(0.01)  # No packet yet — tight loop
+            await asyncio.sleep(0.01)  # No packet yet - tight loop
 
     reader.disconnect()
     log.info("F1 UDP reader stopped.")

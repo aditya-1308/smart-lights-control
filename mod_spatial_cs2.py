@@ -1,5 +1,5 @@
 """
-mod_spatial_cs2.py — Enhanced CS2 spatial effects on Seg 0.
+mod_spatial_cs2.py - Enhanced CS2 spatial effects on Seg 0.
 
 Extends the existing CS2 GSI module with Seg 0 spatial effects:
   - Flashbang: entire Seg 0 blasts white for 2s

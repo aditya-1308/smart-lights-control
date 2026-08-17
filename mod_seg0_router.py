@@ -1,5 +1,5 @@
 """
-mod_seg0_router.py — Seg 0 ownership router.
+mod_seg0_router.py - Seg 0 ownership router.
 
 Reads state.seg0_colors (109-LED frame buffer) and sends it to WLED.
 Automatic priority-based source selection:

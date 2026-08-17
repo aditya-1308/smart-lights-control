@@ -8,7 +8,7 @@ A powerful, lightweight Python background app that turns your **WLED LED strip**
 
 RoomLights controls **4 distinct hardware zones** synchronously:
 
-| Feature / Situation | Seg 0 (109 LEDs — Monitor Perimeter) | Seg 1 + 2 (35 LEDs — Lightbar) | Seg 3 (6 LEDs — Wall Strip) | Tuya Ceiling Light |
+| Feature / Situation | Seg 0 (109 LEDs - Monitor Perimeter) | Seg 1 + 2 (35 LEDs - Lightbar) | Seg 3 (6 LEDs - Wall Strip) | Tuya Ceiling Light |
 |---|---|---|---|---|
 | **Desktop / Movies** | High-speed edge screen sync (**replaces Prismatik**) | Off / Standby | Off / Standby | Real-time screen color ambient (smooth 2s fade) |
 | **150+ Chroma PC Games** *(Cyberpunk 2077, Fortnite, Apex, etc.)* | Intercepts game RGB lighting over local port `54235` | In-game action colors | Off / Standby | Dynamic game ambience |
@@ -93,7 +93,7 @@ pip install -r requirements.txt
 # Start RoomLights
 python main.py
 ```
-*(Make sure to close/quit Prismatik before running — RoomLights now handles Seg 0 screen capture natively!)*
+*(Make sure to close/quit Prismatik before running - RoomLights now handles Seg 0 screen capture natively!)*
 
 ---
 
@@ -103,8 +103,9 @@ python main.py
   - Gamepad FX sends rev lights directly to Seg 1+2 automatically.
   - Seg 0 shows flags, track limit warnings, and sector timing sweeps.
 - **F1 23 / F1 24**:
-  - Set `SIM_GAME=F1` in `.env`.
+  - Telemetry is auto-detected on port 20777.
   - Enable UDP telemetry in F1 settings: `Options → Telemetry Settings → UDP Telemetry: ON`, `UDP Port: 20777`, `UDP Format: 2023/2024`.
+
 
 ---
 
@@ -122,4 +123,4 @@ python main.py
 
 ## 📜 License
 
-MIT License — free for personal and open-source use. See [LICENSE](LICENSE).
+MIT License - free for personal and open-source use. See [LICENSE](LICENSE).

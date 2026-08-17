@@ -1,5 +1,5 @@
 """
-mod_spatial_ac.py — Assetto Corsa spatial telemetry effects on Seg 0.
+mod_spatial_ac.py - Assetto Corsa spatial telemetry effects on Seg 0.
 
 Reads acpmf_graphics and acpmf_physics shared memory for:
   - Flag states (yellow, blue, black, checkered, white)

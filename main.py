@@ -1,9 +1,9 @@
 """
-main.py — RoomLights entry point.
+main.py - RoomLights entry point.
 
 Boots the asyncio event loop and starts all modules as concurrent tasks:
 
-  Phase 1 — Lightbar (Seg 1 + Seg 2):
+  Phase 1 - Lightbar (Seg 1 + Seg 2):
     - Virtual DS4 controller (lightbar interception)
     - Lightbar renderer (DS4 color / rev meter / CS2 flash)
     - Sim racing telemetry reader (AC shared memory / F1 UDP)
@@ -11,7 +11,7 @@ Boots the asyncio event loop and starts all modules as concurrent tasks:
     - Pomodoro timer (Seg 3 wall strip)
     - Tuya ambient ceiling light
 
-  Phase 2 — Seg 0 (109-LED screen strip):
+  Phase 2 - Seg 0 (109-LED screen strip):
     - Seg 0 router (priority-based WLED writer)
     - Screen capture (replaces Prismatik, edge ambient)
     - Chroma bridge (150+ games via Razer Chroma REST API)
@@ -69,7 +69,7 @@ log = logging.getLogger("main")
 # ---------------------------------------------------------------------------
 def _handle_shutdown(sig_name: str) -> None:
     """Signal handler: trigger clean shutdown via the asyncio event."""
-    log.info("Received %s — shutting down...", sig_name)
+    log.info("Received %s - shutting down...", sig_name)
     state.shutdown_event.set()
 
 
@@ -104,7 +104,7 @@ async def main() -> None:
     ds4_controller = mod_dualsense.VirtualDS4Controller()
     ds4_ok = ds4_controller.start()
     if not ds4_ok:
-        log.warning("Virtual DS4 failed to start — "
+        log.warning("Virtual DS4 failed to start - "
                     "DS4 lightbar mode unavailable. Rev meter will be used.")
 
     # ------------------------------------------------------------------
@@ -129,7 +129,7 @@ async def main() -> None:
             # Router: reads state.seg0_colors and sends to WLED at target FPS
             asyncio.create_task(mod_seg0_router.run(wled),   name="seg0_router"),
 
-            # Screen capture: edge ambient — lowest priority fallback
+            # Screen capture: edge ambient - lowest priority fallback
             asyncio.create_task(mod_screen_capture.run(),    name="screen_capture"),
 
             # Chroma bridge: intercepts 150+ games' RGB data
@@ -138,6 +138,9 @@ async def main() -> None:
             # AC spatial: flags, track limits, sector flashes
             asyncio.create_task(mod_spatial_ac.run(),        name="spatial_ac"),
 
+            # F1 spatial: proximity spotter, flags, collisions
+            asyncio.create_task(mod_spatial_f1.run(),        name="spatial_f1"),
+
             # CS2 spatial: flashbang, low health, bomb timer on Seg 0
             asyncio.create_task(mod_spatial_cs2.run(),       name="spatial_cs2"),
 
@@ -145,11 +148,6 @@ async def main() -> None:
             asyncio.create_task(mod_smart_roi.run(),         name="smart_roi"),
         ]
 
-        # F1 spatial only boots when SIM_GAME=F1
-        if config.SIM_GAME == "F1":
-            tasks.append(
-                asyncio.create_task(mod_spatial_f1.run(), name="spatial_f1")
-            )
 
         # DS4 keepalive task (waits for shutdown then cleans up)
         if ds4_ok:

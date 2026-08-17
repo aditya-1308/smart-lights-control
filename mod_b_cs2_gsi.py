@@ -1,5 +1,5 @@
 """
-mod_b_cs2_gsi.py — CS2 Game State Integration HTTP server.
+mod_b_cs2_gsi.py - CS2 Game State Integration HTTP server.
 
 Listens on localhost:3000 for JSON POST requests from CS2's built-in
 Game State Integration (GSI) system.

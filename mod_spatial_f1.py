@@ -1,5 +1,5 @@
 """
-mod_spatial_f1.py — F1 23/24 spatial telemetry effects on Seg 0.
+mod_spatial_f1.py - F1 23/24 spatial telemetry effects on Seg 0.
 
 Parses multiple F1 UDP packet types for rich spatial effects:
   - Proximity spotter: cars alongside left/right (Packet 0: Motion)
@@ -298,12 +298,9 @@ class F1SpatialProcessor:
 
 async def run() -> None:
     """F1 spatial telemetry monitor."""
-    if config.SIM_GAME != "F1":
-        log.info("F1 spatial module skipped (SIM_GAME=%s).", config.SIM_GAME)
-        return
-
-    log.info("F1 spatial module starting on port %d.", config.F1_UDP_PORT)
+    log.info("F1 spatial module starting (UDP port %d)...", config.F1_UDP_PORT)
     processor = F1SpatialProcessor(config.F1_UDP_PORT)
+
 
     if not await asyncio.to_thread(processor.connect):
         return
