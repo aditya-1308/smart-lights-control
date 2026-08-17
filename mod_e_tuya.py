@@ -74,10 +74,10 @@ _NEUTRAL_BRI: int = 60
 # -----------------------------------------------------------------------
 def _start_hotkey_listener() -> None:
     """
-    Hotkeys:
-      Ctrl+Shift+L        : toggle ambient on/off
-      Ctrl+Shift+Up       : brightness +5% (max 100%)
-      Ctrl+Shift+Down     : brightness -5% (min 1%)
+    Hotkeys (configured via .env / config.py):
+      KEYBIND_TUYA_TOGGLE          : toggle ambient on/off
+      KEYBIND_TUYA_BRIGHTNESS_UP    : brightness +1% (max 100%)
+      KEYBIND_TUYA_BRIGHTNESS_DOWN  : brightness -1% (min 1%)
     """
     if not PYNPUT_AVAILABLE:
         log.warning("pynput not installed — hotkeys unavailable.")
@@ -97,17 +97,22 @@ def _start_hotkey_listener() -> None:
         state.tuya_brightness = max(1, state.tuya_brightness - 1)
         log.info("Tuya brightness: %d%%", state.tuya_brightness)
 
-    hotkeys = pynput_keyboard.GlobalHotKeys({
-        "<ctrl>+<shift>+l":   on_toggle,
-        "<ctrl>+<shift>+<up>": on_brightness_up,
-        "<ctrl>+<shift>+<down>": on_brightness_down,
-    })
+    hotkey_dict = {
+        config.KEYBIND_TUYA_TOGGLE:          on_toggle,
+        config.KEYBIND_TUYA_BRIGHTNESS_UP:    on_brightness_up,
+        config.KEYBIND_TUYA_BRIGHTNESS_DOWN:  on_brightness_down,
+    }
+
+    hotkeys = pynput_keyboard.GlobalHotKeys(hotkey_dict)
     hotkeys.start()
     log.info(
-        "Tuya hotkeys: Ctrl+Shift+L=toggle | "
-        "Ctrl+Shift+Up/Down=brightness (current: %d%%)",
+        "Tuya hotkeys registered: toggle='%s' | up='%s' | down='%s' (current: %d%%)",
+        config.KEYBIND_TUYA_TOGGLE,
+        config.KEYBIND_TUYA_BRIGHTNESS_UP,
+        config.KEYBIND_TUYA_BRIGHTNESS_DOWN,
         state.tuya_brightness,
     )
+
 
 
 # -----------------------------------------------------------------------
@@ -367,7 +372,7 @@ async def run() -> None:
 
     last_color: RGB = _NEUTRAL_RGB
     last_enabled: bool = True
-    log.info("Tuya ambient running. Ctrl+Shift+L to toggle.")
+    log.info("Tuya ambient running. Toggle key: '%s'", config.KEYBIND_TUYA_TOGGLE)
 
     while not state.shutdown_event.is_set():
         await asyncio.sleep(_SAMPLE_INTERVAL)

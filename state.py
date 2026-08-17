@@ -81,8 +81,9 @@ class SharedState:
         self.cs2_flashed: int = 0          # 0–255
 
         # -- Tuya ambient --
-        self.tuya_ambient_enabled: bool = True  # Toggle via Ctrl+Shift+L
-        self.tuya_brightness: int = 50          # Manual brightness 1-100 (Ctrl+Shift+Up/Down)
+        self.tuya_ambient_enabled: bool = True  # Toggle via KEYBIND_TUYA_TOGGLE
+        self.tuya_brightness: int = 50          # Manual brightness 1-100 (via KEYBIND_TUYA_BRIGHTNESS_UP/DOWN)
+
 
         # -- Seg 0 (109 LEDs) --
         self.seg0_source: Seg0Source = Seg0Source.SCREEN_CAPTURE

@@ -168,3 +168,11 @@ ROI_DAMAGE_MARGIN_PCT: float = 0.15   # inner margin for damage vignette detecti
 ROI_DAMAGE_DEPTH_PCT: float = 0.10    # depth of detection strips
 ROI_RED_THRESHOLD: int = 150          # red channel threshold for damage flash
 ROI_RED_DOMINANCE: float = 1.5        # R must be this much > G and B
+
+# ===================================================================
+# Keybinds / Hotkeys (pynput format, configurable via .env)
+# ===================================================================
+KEYBIND_TUYA_TOGGLE: str = _get("KEYBIND_TUYA_TOGGLE", "<ctrl>+<shift>+l")
+KEYBIND_TUYA_BRIGHTNESS_UP: str = _get("KEYBIND_TUYA_BRIGHTNESS_UP", "<ctrl>+<shift>+<up>")
+KEYBIND_TUYA_BRIGHTNESS_DOWN: str = _get("KEYBIND_TUYA_BRIGHTNESS_DOWN", "<ctrl>+<shift>+<down>")
+
