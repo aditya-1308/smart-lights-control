@@ -11,7 +11,7 @@ import asyncio
 import threading
 import time
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 class LightbarMode(Enum):
@@ -30,6 +30,16 @@ class AppContext(Enum):
     CS2 = auto()
     RACING = auto()
     GENERIC_GAME = auto()
+
+
+class Seg0Source(Enum):
+    """Who currently owns Seg 0 (109 LEDs)."""
+    SCREEN_CAPTURE = auto()   # Default — screen edge ambient
+    CHROMA = auto()           # Chroma game RGB data active
+    AC_SPATIAL = auto()       # Assetto Corsa spatial telemetry
+    F1_SPATIAL = auto()       # F1 23/24 spatial telemetry
+    CS2_SPATIAL = auto()      # CS2 enhanced spatial effects
+    SMART_ROI = auto()        # Smart ROI directional damage detection
 
 
 class SharedState:
@@ -69,6 +79,15 @@ class SharedState:
         self.cs2_connected: bool = False   # True if GSI POST received recently
         self.cs2_health: int = 100
         self.cs2_flashed: int = 0          # 0–255
+
+        # -- Seg 0 (109 LEDs) --
+        self.seg0_source: Seg0Source = Seg0Source.SCREEN_CAPTURE
+        self.seg0_colors: List[tuple] = [(0, 0, 0)] * 109  # current 109-LED frame
+        self.seg0_dirty: bool = False      # True when colors updated, cleared after send
+
+        # -- Chroma bridge --
+        self.chroma_active: bool = False
+        self.chroma_last_heartbeat: float = 0.0
 
         # -- Shutdown --
         self.shutdown_event: asyncio.Event = asyncio.Event()
@@ -129,6 +148,17 @@ class SharedState:
         """Set the ambient context (async-safe)."""
         async with self._async_lock:
             self.context = ctx
+
+    async def set_seg0_source(self, src: Seg0Source) -> None:
+        """Set the Seg 0 ownership source (async-safe)."""
+        async with self._async_lock:
+            self.seg0_source = src
+
+    def update_seg0_colors(self, colors: List[tuple]) -> None:
+        """Update the 109-LED Seg 0 color buffer (thread-safe)."""
+        with self._thread_lock:
+            self.seg0_colors = colors
+            self.seg0_dirty = True
 
 
 # ---------------------------------------------------------------------------

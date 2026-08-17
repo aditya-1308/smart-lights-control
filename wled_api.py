@@ -212,6 +212,46 @@ class WLEDClient:
             ]
         })
 
+    # -----------------------------------------------------------------
+    # Seg 0 helpers (109-LED screen ambient / spatial effects)
+    # -----------------------------------------------------------------
+    async def set_seg0(self, color_array: List[RGB]) -> bool:
+        """
+        Send a 109-element color array to Seg 0.
+
+        The array maps directly to LED indices 0-108 (clockwise from
+        bottom-middle: bottom-right, right, top, left, bottom-left).
+        """
+        assert len(color_array) == config.SEG0_COUNT, \
+            f"Expected {config.SEG0_COUNT} colors, got {len(color_array)}"
+
+        i_array = _build_per_led_i_array(color_array)
+        return await self.send_state({
+            "seg": [{
+                "id": config.SEG0_ID,
+                "on": True,
+                "fx": 0,
+                "i": i_array,
+            }]
+        })
+
+    async def set_seg0_solid(self, rgb: RGB) -> bool:
+        """Set all 109 LEDs of Seg 0 to a single color."""
+        return await self.send_state({
+            "seg": [{
+                "id": config.SEG0_ID,
+                "on": True,
+                "fx": 0,
+                "col": [list(rgb)],
+            }]
+        })
+
+    async def set_seg0_off(self) -> bool:
+        """Turn Seg 0 off."""
+        return await self.send_state({
+            "seg": [{"id": config.SEG0_ID, "on": False}]
+        })
+
 
 # -----------------------------------------------------------------------
 # Internal helpers

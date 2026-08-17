@@ -52,16 +52,27 @@ WLED_TIMEOUT: float = 1.0  # seconds — silently drop on timeout
 # ---------------------------------------------------------------------------
 # Segment definitions — physical LED layout
 # ---------------------------------------------------------------------------
-# Seg 0: 109 LEDs — Prismatik screen sync (we NEVER write to this)
+# Seg 0: 109 LEDs — screen edge ambient / spatial game effects
+#   Clockwise from bottom-middle:
+#   idx  0-17  : bottom-right (18 LEDs, center → right corner)
+#   idx 18-35  : right edge   (18 LEDs, bottom-right → top-right)
+#   idx 36-71  : top edge     (36 LEDs, top-right → top-left)
+#   idx 72-89  : left edge    (18 LEDs, top-left → bottom-left)
+#   idx 90-108 : bottom-left  (19 LEDs, bottom-left → center)
+#
 # Seg 1:  17 LEDs — right half of lightbar (runs R→L, idx 0 = far right)
 # Seg 2:  18 LEDs — left half of lightbar  (runs L→R, idx 0 = far left)
 # Seg 3:   6 LEDs — Pomodoro bar (vertical on wall, top→bottom)
 #
 # Seg 1 + Seg 2 = one unified 35-LED logical bar.
-#   Logical pos 0  = Seg2 idx 0  (far physical left)
-#   Logical pos 17 = Seg2 idx 17 (inner left)
-#   Logical pos 18 = Seg1 idx 16 (inner right)
-#   Logical pos 34 = Seg1 idx 0  (far physical right)
+SEG0_ID: int = 0
+SEG0_COUNT: int = 109
+SEG0_BOTTOM_RIGHT: tuple = (0, 18)    # idx 0-17,  18 LEDs
+SEG0_RIGHT: tuple = (18, 36)           # idx 18-35, 18 LEDs
+SEG0_TOP: tuple = (36, 72)             # idx 36-71, 36 LEDs
+SEG0_LEFT: tuple = (72, 90)            # idx 72-89, 18 LEDs
+SEG0_BOTTOM_LEFT: tuple = (90, 109)    # idx 90-108, 19 LEDs
+
 SEG1_ID: int = 1
 SEG1_COUNT: int = 17
 SEG2_ID: int = 2
@@ -135,3 +146,25 @@ TUYA_CROSSFADE_STEPS: int = 20          # interpolation steps
 # General
 # ===================================================================
 LIGHTBAR_UPDATE_HZ: int = 30  # max updates/sec to WLED for the lightbar
+
+# ===================================================================
+# Screen Capture (replaces Prismatik for Seg 0)
+# ===================================================================
+SCREEN_CAPTURE_FPS: int = _int("SCREEN_CAPTURE_FPS", 24)
+SCREEN_EDGE_DEPTH_PCT: float = 0.08  # 8% of screen dimension for edge strip
+SCREEN_DOWNSCALE_WIDTH: int = 320     # downscale target for performance
+SCREEN_DOWNSCALE_HEIGHT: int = 180
+
+# ===================================================================
+# Chroma SDK Bridge (intercepts 150+ games' RGB data)
+# ===================================================================
+CHROMA_PORT: int = 54235
+CHROMA_HEARTBEAT_TIMEOUT: float = 5.0  # seconds without heartbeat → session dead
+
+# ===================================================================
+# Smart ROI (directional damage, minimap, health bar detection)
+# ===================================================================
+ROI_DAMAGE_MARGIN_PCT: float = 0.15   # inner margin for damage vignette detection
+ROI_DAMAGE_DEPTH_PCT: float = 0.10    # depth of detection strips
+ROI_RED_THRESHOLD: int = 150          # red channel threshold for damage flash
+ROI_RED_DOMINANCE: float = 1.5        # R must be this much > G and B

@@ -4,3 +4,5 @@ pynput>=1.7
 vgamepad>=0.1
 numpy>=1.26
 python-dotenv>=1.0
+dxcam>=0.4.0
+mss>=9.0
