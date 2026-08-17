@@ -8,7 +8,7 @@ A powerful, lightweight Python background app that turns your **WLED LED strip**
 
 RoomLights controls **4 distinct hardware zones** synchronously:
 
-| Feature / Situation | Seg 0 (109 LEDs - Monitor Perimeter) | Seg 1 + 2 (35 LEDs - Lightbar) | Seg 3 (6 LEDs - Wall Strip) | Tuya Ceiling Light |
+| Feature / Situation | Seg 0 (Monitor Perimeter) | Seg 1 + 2 (Lightbar) | Seg 3 (Wall Strip) | Tuya Ceiling Light |
 |---|---|---|---|---|
 | **Desktop / Movies** | High-speed edge screen sync (**replaces Prismatik**) | Off / Standby | Off / Standby | Real-time screen color ambient (smooth 2s fade) |
 | **150+ Chroma PC Games** *(Cyberpunk 2077, Fortnite, Apex, etc.)* | Intercepts game RGB lighting over local port `54235` | In-game action colors | Off / Standby | Dynamic game ambience |
@@ -21,21 +21,30 @@ RoomLights controls **4 distinct hardware zones** synchronously:
 
 ---
 
-## 🛠️ Hardware & Layout Setup
+## 🛠️ Hardware & Segment Auto-Discovery
 
-RoomLights assumes your WLED strip is configured into 4 segments:
+RoomLights **automatically queries your WLED board on startup** over Wi-Fi (`/json/state`) to discover segment IDs, exact LED counts, and reversed wiring flags (`"rev": true`).
 
-- **Seg 0 (109 LEDs)**: Full perimeter around your monitor (starts bottom-middle, going clockwise: 18 bottom-right, 18 right, 36 top, 18 left, 19 bottom-left).
-- **Seg 1 (17 LEDs)**: Right half of your controller lightbar (wired R→L).
-- **Seg 2 (18 LEDs)**: Left half of your controller lightbar (wired L→R).
-- **Seg 3 (6 LEDs)**: Vertical wall strip (top→bottom).
-- **Tuya / Homemate Ceiling Bulb**: Local smart bulb on your Wi-Fi network.
+### Customizable Segment Role Mapping (`.env`):
+You can map your WLED segment IDs to any role in `.env` (or set a segment ID to `-1` to disable that feature):
+
+```env
+# Role Mapping (Default IDs: 0, 1, 2, 3)
+SEGMENT_SCREEN_CAPTURE=0      # Monitor perimeter (Screen capture & spatial effects)
+SEGMENT_LIGHTBAR_RIGHT=1      # Right lightbar half (wired R→L)
+SEGMENT_LIGHTBAR_LEFT=2       # Left lightbar half (wired L→R)
+SEGMENT_POMODORO=3            # Vertical wall strip (Set to -1 to disable)
+
+# Single-Segment Lightbar Option:
+# If you have ONE continuous strip for your lightbar (e.g. Seg 1), set:
+# SEGMENT_LIGHTBAR=1
+```
 
 ---
 
 ## ⌨️ Customizable Hotkeys
 
-You can control the room ambience on the fly using keyboard shortcuts. Hotkeys are completely customizable in your `.env` file!
+You can control room ambience on the fly using keyboard shortcuts. Hotkeys are completely customizable in `.env`!
 
 | Shortcut (Default) | Function |
 |---|---|
@@ -99,13 +108,12 @@ python main.py
 
 ## 🏎️ Sim Racing Setup
 
+- **Assetto Corsa & F1 23 / F1 24**: Both telemetry sources are **auto-detected on the fly**. No `.env` toggle needed!
 - **Assetto Corsa with CSP (Custom Shaders Patch)**:
   - Gamepad FX sends rev lights directly to Seg 1+2 automatically.
   - Seg 0 shows flags, track limit warnings, and sector timing sweeps.
-- **F1 23 / F1 24**:
-  - Telemetry is auto-detected on port 20777.
+- **F1 23 / F1 24 Settings**:
   - Enable UDP telemetry in F1 settings: `Options → Telemetry Settings → UDP Telemetry: ON`, `UDP Port: 20777`, `UDP Format: 2023/2024`.
-
 
 ---
 
@@ -117,6 +125,7 @@ python main.py
 | **Seg 0 screen capture is laggy** | Adjust `SCREEN_CAPTURE_FPS=24` in `.env`. `dxcam` hardware acceleration is enabled by default. |
 | **Chroma games aren't connecting** | Make sure Razer Synapse is **not** running (Synapse blocks port 54235). |
 | **Tuya ceiling light not responding** | Verify bulb IP in `.env` and run `python -m tinytuya wizard` to refresh local key. |
+| **Single-segment lightbar** | Set `SEGMENT_LIGHTBAR=1` in `.env`. RoomLights will automatically split it down the middle. |
 | **How to stop the app** | Press `Ctrl + C` in the terminal window. |
 
 ---
