@@ -93,6 +93,52 @@ class WLEDClient:
             log.debug("WLED unexpected error: %s", exc)
             return False
 
+    async def fetch_segment_info(self) -> dict:
+        """
+        Query WLED's current segment configuration dynamically over HTTP.
+
+        Returns dict mapping seg_id -> {"len": int, "start": int, "stop": int, "rev": bool, "on": bool}.
+        Returns empty dict if WLED is unreachable.
+        """
+        if self._session is None or self._session.closed:
+            await self.start()
+
+        try:
+            async with self._session.get(config.WLED_STATE_URL) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    # WLED returns state wrapped in state object or root
+                    state_obj = data.get("state", data)
+                    segs = state_obj.get("seg", [])
+                    result = {}
+                    for s in segs:
+                        seg_id = s.get("id", 0)
+                        start = s.get("start", 0)
+                        stop = s.get("stop", 0)
+                        length = s.get("len", max(0, stop - start))
+                        rev = s.get("rev", False)
+                        on = s.get("on", True)
+                        result[seg_id] = {
+                            "len": length,
+                            "start": start,
+                            "stop": stop,
+                            "rev": rev,
+                            "on": on,
+                        }
+                    if result:
+                        log.info("Auto-discovered %d segments from WLED at %s:",
+                                 len(result), config.WLED_IP)
+                        for sid, sinfo in result.items():
+                            log.info("  Seg %d: %d LEDs (idx %d..%d)%s",
+                                     sid, sinfo["len"], sinfo["start"], sinfo["stop"],
+                                     " [REVERSED]" if sinfo["rev"] else "")
+                    return result
+                return {}
+        except Exception as exc:
+            log.warning("Could not auto-discover WLED segments (%s). Using config defaults.", exc)
+            return {}
+
+
     # -----------------------------------------------------------------
     # High-level helpers
     # -----------------------------------------------------------------
@@ -169,21 +215,22 @@ class WLEDClient:
         """
         Send a 35-element color array to the unified lightbar.
 
-        The array is treated as one continuous bar:
-          - ``color_array[0]``  = far physical LEFT  (Seg 2 idx 0)
-          - ``color_array[34]`` = far physical RIGHT (Seg 1 idx 0)
-
-        Seg 2 (18 LEDs, L→R): positions 0–17 sent as-is.
-        Seg 1 (17 LEDs, R→L): positions 18–34 reversed before sending.
+        Supports both 2-segment lightbars (Seg 1 + Seg 2) and single-segment lightbars.
         """
         assert len(color_array) == config.LIGHTBAR_TOTAL, \
             f"Expected {config.LIGHTBAR_TOTAL} colors, got {len(color_array)}"
 
-        # Split into the two physical segments
+        # If both lightbar halves point to the same segment ID (single-segment bar)
+        if config.SEG1_ID == config.SEG2_ID:
+            i_array = _build_per_led_i_array(color_array)
+            return await self.send_state({
+                "seg": [{"id": config.SEG1_ID, "on": True, "fx": 0, "i": i_array}]
+            })
+
+        # Dual-segment lightbar (e.g. Seg 2 = left, Seg 1 = right)
         seg2_colors = color_array[:config.SEG2_COUNT]           # 0..17 → Seg 2
         seg1_colors = color_array[config.SEG2_COUNT:][::-1]     # 18..34 → reversed for Seg 1
 
-        # Build "i" arrays - one color per LED
         seg2_i = _build_per_led_i_array(seg2_colors)
         seg1_i = _build_per_led_i_array(seg1_colors)
 
@@ -195,7 +242,11 @@ class WLEDClient:
         })
 
     async def set_lightbar_solid(self, rgb: RGB) -> bool:
-        """Set both lightbar segments to a single solid color."""
+        """Set lightbar segments to a single solid color."""
+        if config.SEG1_ID == config.SEG2_ID:
+            return await self.send_state({
+                "seg": [{"id": config.SEG1_ID, "on": True, "fx": 0, "col": [list(rgb)]}]
+            })
         return await self.send_state({
             "seg": [
                 {"id": config.SEG1_ID, "on": True, "fx": 0, "col": [list(rgb)]},
@@ -204,13 +255,18 @@ class WLEDClient:
         })
 
     async def set_lightbar_off(self) -> bool:
-        """Turn off both lightbar segments."""
+        """Turn off lightbar segments."""
+        if config.SEG1_ID == config.SEG2_ID:
+            return await self.send_state({
+                "seg": [{"id": config.SEG1_ID, "on": False}]
+            })
         return await self.send_state({
             "seg": [
                 {"id": config.SEG1_ID, "on": False},
                 {"id": config.SEG2_ID, "on": False},
             ]
         })
+
 
     # -----------------------------------------------------------------
     # Seg 0 helpers (109-LED screen ambient / spatial effects)

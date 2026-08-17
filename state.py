@@ -94,8 +94,17 @@ class SharedState:
         self.chroma_active: bool = False
         self.chroma_last_heartbeat: float = 0.0
 
+        # -- Discovered WLED segments --
+        self.wled_segments: dict = {}  # seg_id -> {"len", "start", "stop", "rev", "on"}
+
         # -- Shutdown --
         self.shutdown_event: asyncio.Event = asyncio.Event()
+
+    def set_discovered_segments(self, seg_dict: dict) -> None:
+        """Store discovered segment metadata from WLED."""
+        with self._thread_lock:
+            self.wled_segments = seg_dict
+
 
     # -----------------------------------------------------------------
     # DS4 lightbar - called from a non-asyncio thread (ViGEm callback)

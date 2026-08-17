@@ -65,7 +65,19 @@ WLED_TIMEOUT: float = 1.0  # seconds - silently drop on timeout
 # Seg 3:   6 LEDs - Pomodoro bar (vertical on wall, top→bottom)
 #
 # Seg 1 + Seg 2 = one unified 35-LED logical bar.
-SEG0_ID: int = 0
+# Segment IDs (configurable via .env, default: 0, 1, 2, 3)
+SEG0_ID: int = _int("SEGMENT_SCREEN_CAPTURE", 0)   # Screen capture / spatial effects
+SEG1_ID: int = _int("SEGMENT_LIGHTBAR_RIGHT", 1)   # Right lightbar half (wired R->L)
+SEG2_ID: int = _int("SEGMENT_LIGHTBAR_LEFT", 2)    # Left lightbar half (wired L->R)
+SEG3_ID: int = _int("SEGMENT_POMODORO", 3)         # Pomodoro wall strip (-1 to disable)
+
+# Optional single-segment lightbar override: SEGMENT_LIGHTBAR=1 in .env
+_SEG_LIGHTBAR: int = _int("SEGMENT_LIGHTBAR", -1)
+if _SEG_LIGHTBAR >= 0:
+    SEG1_ID = _SEG_LIGHTBAR
+    SEG2_ID = _SEG_LIGHTBAR
+
+
 SEG0_COUNT: int = 109
 SEG0_BOTTOM_RIGHT: tuple = (0, 18)    # idx 0-17,  18 LEDs
 SEG0_RIGHT: tuple = (18, 36)           # idx 18-35, 18 LEDs
@@ -73,13 +85,11 @@ SEG0_TOP: tuple = (36, 72)             # idx 36-71, 36 LEDs
 SEG0_LEFT: tuple = (72, 90)            # idx 72-89, 18 LEDs
 SEG0_BOTTOM_LEFT: tuple = (90, 109)    # idx 90-108, 19 LEDs
 
-SEG1_ID: int = 1
 SEG1_COUNT: int = 17
-SEG2_ID: int = 2
 SEG2_COUNT: int = 18
-SEG3_ID: int = 3
 SEG3_COUNT: int = 6
 LIGHTBAR_TOTAL: int = SEG2_COUNT + SEG1_COUNT  # 35
+
 
 # ===================================================================
 # Tuya Ceiling Light

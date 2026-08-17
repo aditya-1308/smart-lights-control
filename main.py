@@ -113,16 +113,28 @@ async def main() -> None:
     async with WLEDClient() as wled:
         await wled.start()
 
+        # Auto-discover segment configuration directly from WLED board
+        discovered_segs = await wled.fetch_segment_info()
+        if discovered_segs:
+            state.set_discovered_segments(discovered_segs)
+
         tasks = [
             # ----------------------------------------------------------
-            # Phase 1: Lightbar (Seg 1 + Seg 2) + Pomodoro + Tuya
+            # Phase 1: Lightbar (Seg 1 + Seg 2) + Tuya
             # ----------------------------------------------------------
             asyncio.create_task(mod_lightbar.run(wled),      name="lightbar"),
             asyncio.create_task(mod_a_simracing.run(),        name="simracing"),
             asyncio.create_task(mod_b_cs2_gsi.run(),          name="cs2_gsi"),
-            asyncio.create_task(mod_d_pomodoro.run(wled),     name="pomodoro"),
             asyncio.create_task(mod_e_tuya.run(),             name="tuya"),
+        ]
 
+        # Pomodoro is optional (boots if SEGMENT_POMODORO >= 0)
+        if config.SEG3_ID >= 0:
+            tasks.append(
+                asyncio.create_task(mod_d_pomodoro.run(wled), name="pomodoro")
+            )
+
+        tasks.extend([
             # ----------------------------------------------------------
             # Phase 2: Seg 0 (109 LEDs) spatial system
             # ----------------------------------------------------------
@@ -146,7 +158,8 @@ async def main() -> None:
 
             # Smart ROI: directional damage detection for any game
             asyncio.create_task(mod_smart_roi.run(),         name="smart_roi"),
-        ]
+        ])
+
 
 
         # DS4 keepalive task (waits for shutdown then cleans up)
