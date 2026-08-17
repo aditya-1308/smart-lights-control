@@ -1,0 +1,6 @@
+aiohttp>=3.9
+tinytuya>=1.15
+pynput>=1.7
+vgamepad>=0.1
+numpy>=1.26
+python-dotenv>=1.0

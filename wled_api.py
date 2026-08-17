@@ -1,0 +1,243 @@
+"""
+wled_api.py — Async HTTP wrapper for the WLED JSON API.
+
+Features:
+  - Persistent ``aiohttp.ClientSession`` with connection pooling.
+  - Silently catches and ignores timeouts / connection errors.
+  - Helper to build the ``"i"`` (individual LED) array for per-LED coloring.
+  - Helper to split a 35-element logical lightbar into Seg 1 + Seg 2 payloads,
+    accounting for Seg 1's reversed physical wiring direction.
+"""
+
+import asyncio
+import logging
+from typing import List, Optional, Tuple
+
+import aiohttp
+
+import config
+
+log = logging.getLogger("wled_api")
+
+# Type alias: an RGB color tuple
+RGB = Tuple[int, int, int]
+
+
+class WLEDClient:
+    """
+    Async HTTP client for WLED's ``/json/state`` endpoint.
+
+    Usage::
+
+        async with WLEDClient() as wled:
+            await wled.set_solid(seg_id=1, rgb=(255, 0, 0))
+            await wled.set_lightbar(color_array)
+    """
+
+    def __init__(self) -> None:
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._timeout = aiohttp.ClientTimeout(total=config.WLED_TIMEOUT)
+        # Rate-limit: minimum interval between requests (seconds)
+        self._min_interval = 1.0 / config.LIGHTBAR_UPDATE_HZ
+        self._last_send_time: float = 0.0
+
+    async def __aenter__(self) -> "WLEDClient":
+        await self.start()
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.close()
+
+    async def start(self) -> None:
+        """Create the persistent HTTP session."""
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(limit=2, keepalive_timeout=30)
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=self._timeout,
+            )
+
+    async def close(self) -> None:
+        """Close the HTTP session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    # -----------------------------------------------------------------
+    # Low-level send
+    # -----------------------------------------------------------------
+    async def send_state(self, payload: dict) -> bool:
+        """
+        POST a partial JSON state update to WLED.
+
+        Returns True on success, False on any error (silently swallowed).
+        """
+        if self._session is None or self._session.closed:
+            await self.start()
+
+        try:
+            async with self._session.post(
+                config.WLED_STATE_URL,
+                json=payload,
+            ) as resp:
+                if resp.status == 200:
+                    return True
+                log.warning("WLED responded %d", resp.status)
+                return False
+        except asyncio.TimeoutError:
+            # Expected when WLED is busy — silently drop
+            return False
+        except aiohttp.ClientError as exc:
+            log.debug("WLED connection error: %s", exc)
+            return False
+        except Exception as exc:
+            log.debug("WLED unexpected error: %s", exc)
+            return False
+
+    # -----------------------------------------------------------------
+    # High-level helpers
+    # -----------------------------------------------------------------
+    async def set_solid(self, seg_id: int, rgb: RGB, brightness: int = 255) -> bool:
+        """Set a segment to a solid color (effect = 0 / Solid)."""
+        return await self.send_state({
+            "seg": [{
+                "id": seg_id,
+                "on": True,
+                "bri": brightness,
+                "fx": 0,
+                "col": [list(rgb)],
+            }]
+        })
+
+    async def set_segment_off(self, seg_id: int) -> bool:
+        """Turn a segment off."""
+        return await self.send_state({
+            "seg": [{"id": seg_id, "on": False}]
+        })
+
+    async def set_individual_leds(self, seg_id: int, i_array: list) -> bool:
+        """
+        Set individual LEDs within a segment using WLED's ``"i"`` array.
+
+        ``i_array`` format: ``[start, stop, [R,G,B], start, stop, [R,G,B], ...]``
+        where ``stop`` is exclusive and indices are segment-relative.
+        """
+        return await self.send_state({
+            "seg": [{
+                "id": seg_id,
+                "on": True,
+                "fx": 0,    # Solid — "i" array overrides per-LED
+                "i": i_array,
+            }]
+        })
+
+    async def set_effect(
+        self,
+        seg_id: int,
+        fx: int,
+        ix: int = 128,
+        sx: int = 128,
+        col: Optional[RGB] = None,
+        brightness: int = 255,
+    ) -> bool:
+        """
+        Set a built-in WLED effect on a segment.
+
+        Args:
+            seg_id: WLED segment ID.
+            fx: Effect ID (e.g. 98 = Percent).
+            ix: Effect intensity (0–255).
+            sx: Effect speed (0–255).
+            col: Primary color as (R, G, B).
+            brightness: Segment brightness (0–255).
+        """
+        seg: dict = {
+            "id": seg_id,
+            "on": True,
+            "bri": brightness,
+            "fx": fx,
+            "ix": ix,
+            "sx": sx,
+        }
+        if col is not None:
+            seg["col"] = [list(col)]
+        return await self.send_state({"seg": [seg]})
+
+    # -----------------------------------------------------------------
+    # Lightbar helpers (35-LED unified bar → Seg 1 + Seg 2)
+    # -----------------------------------------------------------------
+    async def set_lightbar(self, color_array: List[RGB]) -> bool:
+        """
+        Send a 35-element color array to the unified lightbar.
+
+        The array is treated as one continuous bar:
+          - ``color_array[0]``  = far physical LEFT  (Seg 2 idx 0)
+          - ``color_array[34]`` = far physical RIGHT (Seg 1 idx 0)
+
+        Seg 2 (18 LEDs, L→R): positions 0–17 sent as-is.
+        Seg 1 (17 LEDs, R→L): positions 18–34 reversed before sending.
+        """
+        assert len(color_array) == config.LIGHTBAR_TOTAL, \
+            f"Expected {config.LIGHTBAR_TOTAL} colors, got {len(color_array)}"
+
+        # Split into the two physical segments
+        seg2_colors = color_array[:config.SEG2_COUNT]           # 0..17 → Seg 2
+        seg1_colors = color_array[config.SEG2_COUNT:][::-1]     # 18..34 → reversed for Seg 1
+
+        # Build "i" arrays — one color per LED
+        seg2_i = _build_per_led_i_array(seg2_colors)
+        seg1_i = _build_per_led_i_array(seg1_colors)
+
+        return await self.send_state({
+            "seg": [
+                {"id": config.SEG2_ID, "on": True, "fx": 0, "i": seg2_i},
+                {"id": config.SEG1_ID, "on": True, "fx": 0, "i": seg1_i},
+            ]
+        })
+
+    async def set_lightbar_solid(self, rgb: RGB) -> bool:
+        """Set both lightbar segments to a single solid color."""
+        return await self.send_state({
+            "seg": [
+                {"id": config.SEG1_ID, "on": True, "fx": 0, "col": [list(rgb)]},
+                {"id": config.SEG2_ID, "on": True, "fx": 0, "col": [list(rgb)]},
+            ]
+        })
+
+    async def set_lightbar_off(self) -> bool:
+        """Turn off both lightbar segments."""
+        return await self.send_state({
+            "seg": [
+                {"id": config.SEG1_ID, "on": False},
+                {"id": config.SEG2_ID, "on": False},
+            ]
+        })
+
+
+# -----------------------------------------------------------------------
+# Internal helpers
+# -----------------------------------------------------------------------
+def _build_per_led_i_array(colors: List[RGB]) -> list:
+    """
+    Build an ``"i"`` array that sets each LED individually.
+
+    Uses run-length encoding: consecutive LEDs with the same color
+    are collapsed into a single ``[start, stop, [R,G,B]]`` entry
+    to reduce payload size.
+    """
+    if not colors:
+        return []
+
+    i_array: list = []
+    run_start = 0
+    run_color = colors[0]
+
+    for idx in range(1, len(colors)):
+        if colors[idx] != run_color:
+            # Flush the current run
+            i_array.extend([run_start, idx, list(run_color)])
+            run_start = idx
+            run_color = colors[idx]
+
+    # Flush the last run
+    i_array.extend([run_start, len(colors), list(run_color)])
+    return i_array
