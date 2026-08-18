@@ -100,11 +100,16 @@ async def main() -> None:
     # ------------------------------------------------------------------
     # Start virtual DS4 controller (background thread via Win32 callback)
     # ------------------------------------------------------------------
-    ds4_controller = mod_dualsense.VirtualDS4Controller()
-    ds4_ok = ds4_controller.start()
-    if not ds4_ok:
-        log.warning("Virtual DS4 failed to start - "
-                    "DS4 lightbar mode unavailable. Rev meter will be used.")
+    ds4_controller = None
+    ds4_ok = False
+    if config.ENABLE_VIRTUAL_DS4:
+        ds4_controller = mod_dualsense.VirtualDS4Controller()
+        ds4_ok = ds4_controller.start()
+        if not ds4_ok:
+            log.warning("Virtual DS4 failed to start - "
+                        "DS4 lightbar mode unavailable. Rev meter will be used.")
+    else:
+        log.info("Virtual DS4 disabled (allowing physical Xbox controller priority).")
 
     # ------------------------------------------------------------------
     # Create the shared WLED HTTP client (one session for all modules)

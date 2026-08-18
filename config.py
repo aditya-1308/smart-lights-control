@@ -127,6 +127,10 @@ REV_RED_ZONE    = list(range(16, 20))                         # center 4 LEDs
 # ===================================================================
 # DS4 Virtual Controller
 # ===================================================================
+# Set to true ONLY if you want to emulate a DualShock 4 controller for
+# Sony PC games (GTA V, Spider-Man). Set to false when using an Xbox controller
+# so games don't prioritize the virtual DS4 over your physical Xbox controller.
+ENABLE_VIRTUAL_DS4: bool = _get("ENABLE_VIRTUAL_DS4", "false").lower() in ("true", "1", "yes")
 DS4_LIGHTBAR_TIMEOUT: float = 3.0
 
 # ===================================================================
@@ -157,7 +161,7 @@ LIGHTBAR_UPDATE_HZ: int = 30
 # ===================================================================
 # Screen Capture (Seg 0 Realtime UDP)
 # ===================================================================
-SCREEN_CAPTURE_FPS: int = _int("SCREEN_CAPTURE_FPS", 30)
+SCREEN_CAPTURE_FPS: int = _int("SCREEN_CAPTURE_FPS", 60)
 SCREEN_CAPTURE_GAMMA: float = _float("SCREEN_CAPTURE_GAMMA", 1.8)
 SCREEN_CAPTURE_SATURATION: float = _float("SCREEN_CAPTURE_SATURATION", 1.3)
 SCREEN_CAPTURE_SWAP_RGB: bool = _get("SCREEN_CAPTURE_SWAP_RGB", "false").lower() in ("true", "1", "yes")
