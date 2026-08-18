@@ -98,18 +98,9 @@ async def main() -> None:
             pass
 
     # ------------------------------------------------------------------
-    # Start virtual DS4 controller (background thread via Win32 callback)
+    # Initialize virtual DS4 controller (attaches dynamically per-game)
     # ------------------------------------------------------------------
-    ds4_controller = None
-    ds4_ok = False
-    if config.ENABLE_VIRTUAL_DS4:
-        ds4_controller = mod_dualsense.VirtualDS4Controller()
-        ds4_ok = ds4_controller.start()
-        if not ds4_ok:
-            log.warning("Virtual DS4 failed to start - "
-                        "DS4 lightbar mode unavailable. Rev meter will be used.")
-    else:
-        log.info("Virtual DS4 disabled (allowing physical Xbox controller priority).")
+    ds4_controller = mod_dualsense.VirtualDS4Controller()
 
     # ------------------------------------------------------------------
     # Create the shared WLED HTTP client (one session for all modules)
@@ -163,13 +154,12 @@ async def main() -> None:
 
 
 
-        # DS4 keepalive task (waits for shutdown then cleans up)
-        if ds4_ok:
-            tasks.append(
-                asyncio.create_task(
-                    mod_dualsense.run(ds4_controller), name="ds4"
-                )
+        # DS4 auto-detection task (dynamically attaches only when PS lightbar games launch)
+        tasks.append(
+            asyncio.create_task(
+                mod_dualsense.run(ds4_controller), name="ds4"
             )
+        )
 
         log.info("All %d modules started. Press Ctrl+C to stop.", len(tasks))
         log.info("-" * 60)

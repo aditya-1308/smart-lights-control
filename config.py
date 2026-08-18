@@ -161,7 +161,8 @@ LIGHTBAR_UPDATE_HZ: int = 30
 # ===================================================================
 # Screen Capture (Seg 0 Realtime UDP)
 # ===================================================================
-SCREEN_CAPTURE_FPS: int = _int("SCREEN_CAPTURE_FPS", 60)
+# Defaults to 24 FPS (or value configured in .env)
+SCREEN_CAPTURE_FPS: int = _int("SCREEN_CAPTURE_FPS", 24)
 SCREEN_CAPTURE_GAMMA: float = _float("SCREEN_CAPTURE_GAMMA", 1.8)
 SCREEN_CAPTURE_SATURATION: float = _float("SCREEN_CAPTURE_SATURATION", 1.3)
 SCREEN_CAPTURE_SWAP_RGB: bool = _get("SCREEN_CAPTURE_SWAP_RGB", "false").lower() in ("true", "1", "yes")

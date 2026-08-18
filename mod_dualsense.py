@@ -1,31 +1,15 @@
 """
-mod_dualsense.py - Virtual DS4 controller + lightbar interception.
+mod_dualsense.py - Dynamic Virtual DS4 controller + lightbar interception.
 
-Creates a virtual DualShock 4 controller via ViGEmBus so that games send
-lightbar RGB data to it. Uses ctypes to hook ViGEmClient.dll directly for
-the DS4_LIGHTBAR_COLOR struct (bypassing vgamepad's high-level API which
-does not expose the raw RGB bytes).
+Auto-detects when a PlayStation lightbar game (GTA V, Cyberpunk, Spider-Man,
+Death Stranding, etc.) is launched and dynamically attaches the virtual DS4
+controller AFTER your physical Xbox controller has already claimed Index 0.
 
-How it works:
-  1. vgamepad creates the virtual DS4 device (handles driver lifecycle).
-  2. We load ViGEmClient.dll via ctypes and re-register our own callback
-     using vigem_target_ds4_register_notification() to receive the full
-     DS4_LIGHTBAR_COLOR struct on every HID output report from the game.
-  3. Received RGB is written to state.set_lightbar_rgb().
-  4. mod_lightbar.py reads state and applies to Seg 1 + Seg 2.
-
-Game compatibility:
-  GTA V:       Steam Input OFF - native DirectHID lightbar.
-  AC + CSP:    Steam Input OFF - CSP Gamepad FX writes HID directly.
-  F1 23/24:    NO lightbar - falls back to rev meter in mod_a_simracing.py.
-  CS2:         NO lightbar - handled by mod_b_cs2_gsi.py.
-  Cyberpunk:   Steam Input OFF - native DirectHID.
-  Sony ports:  Steam Input OFF - native DirectHID.
-
-Prerequisite: ViGEmBus driver installed.
-  https://github.com/nefarius/ViGEmBus/releases
+When the game closes, it automatically detaches the virtual DS4 so your
+Xbox controller remains completely uninterrupted in Assetto Corsa and other games.
 """
 
+import asyncio
 import ctypes
 import ctypes.wintypes
 import logging
@@ -36,7 +20,7 @@ from ctypes import (
     c_int, c_ubyte, c_ulong, c_void_p,
 )
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set
 
 try:
     import vgamepad as vg
@@ -49,12 +33,79 @@ from state import state
 
 log = logging.getLogger("dualsense")
 
+# List of known PC games with native DualShock 4 / DualSense lightbar support
+_DS4_GAMES: Set[str] = {
+    "gta5.exe",
+    "cyberpunk2077.exe",
+    "spiderman.exe",
+    "spidermanmilesmorales.exe",
+    "deathstranding.exe",
+    "ds.exe",
+    "horizonzerodawn.exe",
+    "horizonforbiddenwest.exe",
+    "gow.exe",
+    "godofwar.exe",
+    "thelastofus.exe",
+    "tlou-i.exe",
+    "ratchet.exe",
+    "uncharted.exe",
+    "u4.exe",
+    "daysgone.exe",
+    "ghostoftsushima.exe",
+    "returnal.exe",
+    "helldivers2.exe",
+    "detroitbecomehuman.exe",
+    "untildawn.exe",
+}
+
+
+# ---------------------------------------------------------------------------
+# Win32 Process Snapshot Helper (ultra-fast < 0.2ms check)
+# ---------------------------------------------------------------------------
+class PROCESSENTRY32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.wintypes.DWORD),
+        ("cntUsage", ctypes.wintypes.DWORD),
+        ("th32ProcessID", ctypes.wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", ctypes.wintypes.DWORD),
+        ("cntThreads", ctypes.wintypes.DWORD),
+        ("th32ParentProcessID", ctypes.wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("szExeFile", ctypes.c_char * 260),
+    ]
+
+
+def is_ds4_game_running() -> bool:
+    """Check if any game with PS lightbar support is currently running."""
+    TH32CS_SNAPPROCESS = 0x00000002
+    kernel32 = ctypes.windll.kernel32
+    h_snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if h_snapshot == -1 or h_snapshot == 0:
+        return False
+
+    pe = PROCESSENTRY32()
+    pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+    found = False
+
+    if kernel32.Process32First(h_snapshot, ctypes.byref(pe)):
+        while True:
+            exe_name = pe.szExeFile.decode("utf-8", errors="ignore").lower()
+            if exe_name in _DS4_GAMES:
+                found = True
+                break
+            if not kernel32.Process32Next(h_snapshot, ctypes.byref(pe)):
+                break
+
+    kernel32.CloseHandle(h_snapshot)
+    return found
+
 
 # ---------------------------------------------------------------------------
 # ViGEmClient ctypes structures
 # ---------------------------------------------------------------------------
 class DS4_LIGHTBAR_COLOR(Structure):
-    """Mirrors the C struct DS4_LIGHTBAR_COLOR from ViGEmClient.h."""
     _fields_ = [
         ("Red",   c_ubyte),
         ("Green", c_ubyte),
@@ -62,33 +113,23 @@ class DS4_LIGHTBAR_COLOR(Structure):
     ]
 
 
-# Callback signature: EVT_VIGEM_DS4_NOTIFICATION
-# void callback(client, target, LargeMotor, SmallMotor, LightbarColor, UserData)
 DS4_NOTIFICATION_CB = CFUNCTYPE(
-    None,           # return void
-    c_void_p,       # PVIGEM_CLIENT  Client
-    c_void_p,       # PVIGEM_TARGET  Target
-    c_ubyte,        # UCHAR          LargeMotor
-    c_ubyte,        # UCHAR          SmallMotor
-    DS4_LIGHTBAR_COLOR,  # DS4_LIGHTBAR_COLOR  LightbarColor
-    c_void_p,       # LPVOID         UserData
+    None,
+    c_void_p,
+    c_void_p,
+    c_ubyte,
+    c_ubyte,
+    DS4_LIGHTBAR_COLOR,
+    c_void_p,
 )
 
 
 def _find_vigem_dll() -> Optional[Path]:
-    """
-    Locate ViGEmClient.dll.
-
-    vgamepad bundles it; fall back to a few well-known install paths.
-    """
     candidates = []
-
-    # vgamepad bundles ViGEmClient.dll next to its own package files
     if VGAMEPAD_AVAILABLE:
         pkg_dir = Path(vg.__file__).parent
         candidates.extend(pkg_dir.rglob("ViGEmClient.dll"))
 
-    # Well-known standalone install paths
     candidates += [
         Path(r"C:\Program Files\ViGEm\ViGEmClient.dll"),
         Path(r"C:\Windows\System32\ViGEmClient.dll"),
@@ -102,138 +143,75 @@ def _find_vigem_dll() -> Optional[Path]:
 
 
 class VirtualDS4Controller:
-    """
-    Manages the lifetime of the virtual DS4 device and the lightbar callback.
-
-    Usage::
-
-        ctrl = VirtualDS4Controller()
-        ctrl.start()       # creates device, registers callback
-        # ... run your app ...
-        ctrl.stop()        # cleans up
-    """
+    """Manages dynamic lifetime of the virtual DS4 device."""
 
     def __init__(self) -> None:
-        self._gamepad: Optional[object] = None   # vg.VDS4Gamepad instance
-        self._vigem: Optional[CDLL] = None       # ViGEmClient.dll handle
-        self._client: Optional[c_void_p] = None  # PVIGEM_CLIENT
-        self._target: Optional[c_void_p] = None  # PVIGEM_TARGET
-        self._cb_ref = None  # Keep callback alive (prevent GC)
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
+        self._gamepad: Optional[object] = None
+        self._vigem: Optional[CDLL] = None
+        self._client: Optional[c_void_p] = None
+        self._target: Optional[c_void_p] = None
+        self._cb_ref = None
+        self._is_active = False
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    @property
+    def is_active(self) -> bool:
+        return self._is_active
+
     def start(self) -> bool:
-        """
-        Create the virtual DS4 device and register the lightbar callback.
-
-        Returns True on success, False if ViGEmBus is not installed or
-        any other setup error occurs.
-        """
+        if self._is_active:
+            return True
         if not VGAMEPAD_AVAILABLE:
-            log.error("vgamepad not installed. Run: pip install vgamepad")
             return False
 
-        # 1. Create virtual DS4 via vgamepad (handles driver bookkeeping)
         try:
             self._gamepad = vg.VDS4Gamepad()
-            log.info("Virtual DS4 created via vgamepad.")
+            log.info("Virtual DS4 attached dynamically.")
         except Exception as exc:
-            log.error("Failed to create virtual DS4: %s", exc)
-            log.error("Is ViGEmBus driver installed? "
-                      "https://github.com/nefarius/ViGEmBus/releases")
+            log.warning("Could not attach virtual DS4: %s", exc)
             return False
 
-        # 2. Load ViGEmClient.dll for raw callback access
         dll_path = _find_vigem_dll()
         if dll_path is None:
-            log.error("ViGEmClient.dll not found. "
-                      "Install ViGEmBus or pip install vgamepad.")
             return False
 
         try:
             self._vigem = ctypes.CDLL(str(dll_path))
-        except OSError as exc:
-            log.error("Could not load ViGEmClient.dll: %s", exc)
-            return False
-
-        # 3. Get the internal client/target pointers from vgamepad's objects.
-        #    vgamepad stores them as _client and _target attributes (ctypes ptrs).
-        try:
             self._client = self._gamepad._client  # type: ignore[attr-defined]
             self._target = self._gamepad._target  # type: ignore[attr-defined]
-        except AttributeError:
-            # Fallback: allocate our own via the DLL
-            log.warning("Could not access vgamepad internals; "
-                        "allocating ViGEm client manually.")
-            self._vigem.vigem_alloc.restype = c_void_p
-            self._vigem.vigem_alloc.argtypes = []
-            raw_client = self._vigem.vigem_alloc()
-            if not raw_client:
-                log.error("vigem_alloc() returned NULL")
-                return False
-            # Wrap raw int address in c_void_p so ctypes marshals it correctly
-            self._client = c_void_p(raw_client)
-            self._vigem.vigem_connect.restype = c_int
-            self._vigem.vigem_connect.argtypes = [c_void_p]
-            err = self._vigem.vigem_connect(self._client)
-            if err != 0:
-                log.error("vigem_connect() failed: 0x%X", err)
-                return False
-            self._vigem.vigem_target_ds4_alloc.restype = c_void_p
-            self._vigem.vigem_target_ds4_alloc.argtypes = []
-            raw_target = self._vigem.vigem_target_ds4_alloc()
-            if not raw_target:
-                log.error("vigem_target_ds4_alloc() returned NULL")
-                return False
-            self._target = c_void_p(raw_target)
-            self._vigem.vigem_target_add.restype = c_int
-            self._vigem.vigem_target_add.argtypes = [c_void_p, c_void_p]
-            err = self._vigem.vigem_target_add(self._client, self._target)
-            if err != 0:
-                log.error("vigem_target_add() failed: 0x%X", err)
-                return False
+        except Exception:
+            return False
 
-        # 4. Register our lightbar callback
         cb = DS4_NOTIFICATION_CB(self._on_ds4_notification)
-        self._cb_ref = cb  # Must keep reference to prevent garbage collection!
+        self._cb_ref = cb
 
         self._vigem.vigem_target_ds4_register_notification.argtypes = [
-            c_void_p,           # client
-            c_void_p,           # target
-            DS4_NOTIFICATION_CB, # callback
-            c_void_p,           # user data
+            c_void_p,
+            c_void_p,
+            DS4_NOTIFICATION_CB,
+            c_void_p,
         ]
         err = self._vigem.vigem_target_ds4_register_notification(
             self._client, self._target, cb, None
         )
         if err != 0:
-            log.error("vigem_target_ds4_register_notification() failed: 0x%X", err)
             return False
 
-        self._running = True
-        log.info("DS4 lightbar callback registered. Waiting for game data...")
-        log.info("IMPORTANT: Disable Steam Input in Steam game properties "
-                 "for DirectHID games (GTA V, AC+CSP).")
+        self._is_active = True
+        log.info("Virtual DS4 listening for game lightbar output.")
         return True
 
     def stop(self) -> None:
-        """Unregister callback and clean up."""
-        self._running = False
+        if not self._is_active:
+            return
+        self._is_active = False
         if self._vigem and self._client and self._target:
             try:
                 self._vigem.vigem_target_ds4_unregister_notification(self._target)
             except Exception:
                 pass
-        # vgamepad handles device removal on GC / __del__
         self._gamepad = None
-        log.info("Virtual DS4 stopped.")
+        log.info("Virtual DS4 detached.")
 
-    # ------------------------------------------------------------------
-    # ViGEm callback - called from Win32 thread pool, NOT asyncio thread
-    # ------------------------------------------------------------------
     def _on_ds4_notification(
         self,
         client: c_void_p,
@@ -243,30 +221,31 @@ class VirtualDS4Controller:
         lightbar: DS4_LIGHTBAR_COLOR,
         user_data: c_void_p,
     ) -> None:
-        """
-        Fired by ViGEm whenever the game/Steam writes an HID output report.
-
-        This runs on a Win32 thread, not the asyncio event loop.
-        We only write to state (thread-safe via threading.Lock).
-        """
-        r, g, b = lightbar.Red, lightbar.Green, lightbar.Blue
-        state.set_lightbar_rgb(r, g, b)
-        # Uncomment for debugging:
-        # log.debug("DS4 lightbar: #%02X%02X%02X  rumble=(%d,%d)",
-        #           r, g, b, large_motor, small_motor)
+        state.set_lightbar_rgb(lightbar.Red, lightbar.Green, lightbar.Blue)
 
 
 # ---------------------------------------------------------------------------
-# Module entry point - called from main.py
+# Dynamic background supervisor loop
 # ---------------------------------------------------------------------------
 async def run(controller: VirtualDS4Controller) -> None:
     """
-    Keeps the DS4 controller alive until shutdown.
-
-    The actual work happens in the Win32 callback thread registered by
-    ``controller.start()``. This coroutine just waits for shutdown.
+    Supervises the DS4 controller:
+    - Auto-starts when a supported game is launched.
+    - Auto-stops when the game closes.
     """
-    log.info("DS4 module running. Waiting for lightbar data from games...")
-    await state.shutdown_event.wait()
-    controller.stop()
+    log.info("DS4 auto-detector running (waiting for PlayStation lightbar games)...")
+
+    while not state.shutdown_event.is_set():
+        game_active = await asyncio.to_thread(is_ds4_game_running)
+
+        if config.ENABLE_VIRTUAL_DS4 or game_active:
+            if not controller.is_active:
+                await asyncio.to_thread(controller.start)
+        else:
+            if controller.is_active:
+                await asyncio.to_thread(controller.stop)
+
+        await asyncio.sleep(2.0)
+
+    await asyncio.to_thread(controller.stop)
     log.info("DS4 module stopped.")
