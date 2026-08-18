@@ -169,16 +169,28 @@ class VirtualDS4Controller:
             log.warning("Could not access vgamepad internals; "
                         "allocating ViGEm client manually.")
             self._vigem.vigem_alloc.restype = c_void_p
-            self._client = self._vigem.vigem_alloc()
-            if not self._client:
+            self._vigem.vigem_alloc.argtypes = []
+            raw_client = self._vigem.vigem_alloc()
+            if not raw_client:
                 log.error("vigem_alloc() returned NULL")
                 return False
+            # Wrap raw int address in c_void_p so ctypes marshals it correctly
+            self._client = c_void_p(raw_client)
+            self._vigem.vigem_connect.restype = c_int
+            self._vigem.vigem_connect.argtypes = [c_void_p]
             err = self._vigem.vigem_connect(self._client)
             if err != 0:
                 log.error("vigem_connect() failed: 0x%X", err)
                 return False
             self._vigem.vigem_target_ds4_alloc.restype = c_void_p
-            self._target = self._vigem.vigem_target_ds4_alloc()
+            self._vigem.vigem_target_ds4_alloc.argtypes = []
+            raw_target = self._vigem.vigem_target_ds4_alloc()
+            if not raw_target:
+                log.error("vigem_target_ds4_alloc() returned NULL")
+                return False
+            self._target = c_void_p(raw_target)
+            self._vigem.vigem_target_add.restype = c_int
+            self._vigem.vigem_target_add.argtypes = [c_void_p, c_void_p]
             err = self._vigem.vigem_target_add(self._client, self._target)
             if err != 0:
                 log.error("vigem_target_add() failed: 0x%X", err)

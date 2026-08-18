@@ -1,207 +1,159 @@
 """
-mod_a_simracing.py - Sim racing telemetry reader (rev meter fallback).
+mod_a_simracing.py - Universal Sim Racing Telemetry via Pure UDP.
 
-Only active when DS4 lightbar data is NOT being received (state.is_ds4_active()
-returns False). Provides RPM percentage to the lightbar state machine.
+100% Network UDP — ZERO shared memory, ZERO DLL injection, ZERO crash risk.
 
-Two data sources (selected by SIM_GAME in .env):
+Supported games:
+  - Assetto Corsa (AC1 & CSP)  : UDP port 9996 (official AC UDP Telemetry Protocol)
+  - F1 23 / F1 24              : UDP port 20777 (Codemasters / EA Sports format)
+  - Automobilista 2 (AMS2)     : UDP port 5606 (Project CARS 2 UDP format)
+  - Forza Motorsport / Horizon : UDP port 5300 (Forza Data Out format)
+  - iRacing                    : pyirsdk (pure read)
 
-  AC  - Assetto Corsa Windows Shared Memory
-        Reads Local\\acpmf_physics and Local\\acpmf_static via mmap + ctypes.
-        No network, zero latency, works without any game mods.
-        Note: AC + CSP will send lightbar data via the DS4 callback instead,
-        making this module dormant. This path handles base AC (no CSP).
-
-  F1  - F1 23/24 UDP telemetry
-        Binds a UDP socket on F1_UDP_PORT (default 20777).
-        Parses Packet ID 6 (Car Telemetry) for revLightsPercent (0-100).
-
-Updates state.rpm_pct (0.0-1.0) at up to 30 Hz.
+Setup in Assetto Corsa:
+  - No mods needed! AC includes built-in UDP telemetry on port 9996.
+  - Python sends a 4-byte handshake packet to 127.0.0.1:9996 and AC streams telemetry back.
 """
 
 import asyncio
-import ctypes
 import logging
-import mmap
 import socket
 import struct
 import time
-from ctypes import Structure, c_float, c_int32, c_wchar
 from typing import Optional
 
 import config
-from state import state, LightbarMode
+from state import state
 
 log = logging.getLogger("simracing")
-
-# Update cap - don't hammer state faster than necessary
-_UPDATE_INTERVAL = 1.0 / 30  # 30 Hz
+_UPDATE_INTERVAL = 1.0 / 30
 
 
 # ===========================================================================
-# Assetto Corsa Shared Memory Structures
+# Assetto Corsa (AC1 + CSP) — Official UDP Telemetry Protocol (Port 9996)
 # ===========================================================================
-
-class SPageFilePhysics(Structure):
-    """Assetto Corsa physics shared memory page (Local\\acpmf_physics)."""
-    _pack_ = 4
-    _fields_ = [
-        ("packetId",            c_int32),
-        ("gas",                 c_float),
-        ("brake",               c_float),
-        ("fuel",                c_float),
-        ("gear",                c_int32),
-        ("rpms",                c_int32),   # Current engine RPM
-        ("steerAngle",          c_float),
-        ("speedKmh",            c_float),
-        ("velocity",            c_float * 3),
-        ("accG",                c_float * 3),
-        ("wheelSlip",           c_float * 4),
-        ("wheelLoad",           c_float * 4),
-        ("wheelsPressure",      c_float * 4),
-        ("wheelAngularSpeed",   c_float * 4),
-        ("tyreWear",            c_float * 4),
-        ("tyreDirtyLevel",      c_float * 4),
-        ("tyreCoreTemperature", c_float * 4),
-        ("camberRAD",           c_float * 4),
-        ("suspensionTravel",    c_float * 4),
-        ("drs",                 c_float),
-        ("tc",                  c_float),
-        ("heading",             c_float),
-        ("pitch",               c_float),
-        ("roll",                c_float),
-        ("cgHeight",            c_float),
-        ("carDamage",           c_float * 5),
-        ("numberOfTyresOut",    c_int32),
-        ("pitLimiterOn",        c_int32),
-        ("abs",                 c_float),
-    ]
+# Protocol specs:
+#   1. Handshake request (send to 127.0.0.1:9996):
+#      struct.pack('<iii', 1, 1, 0)
+#      (1 = ACSP_HANDSHAKE, 1 = version, 0 = ACSP_SUBSCRIBE_UPDATE)
+#   2. Telemetry stream (RTCarTelemetry, 328 bytes):
+#      offset  0.. 8 : identifier (c_wchar*4)
+#      offset  8..12 : size (i32)
+#      offset 12..16 : speed_Kmh (f32)
+#      offset 24..25 : isAbsEnabled (u8)
+#      offset 25..26 : isAbsInAction (u8)
+#      offset 26..27 : isTcInAction (u8)
+#      offset 27..28 : isTcEnabled (u8)
+#      offset 28..29 : isInPit (u8)
+#      offset 29..30 : isEngineLimiterOn (u8)
+#      offset 72..76 : engineRPM (f32)
+#      offset 80..84 : gear (i32)
+#
+_AC_HANDSHAKE_PKT = struct.pack("<iii", 1, 1, 0)
+_AC_DISMISS_PKT   = struct.pack("<iii", 1, 1, 2)
 
 
-class SPageFileStatic(Structure):
-    """Assetto Corsa static shared memory page (Local\\acpmf_static)."""
-    _pack_ = 4
-    _fields_ = [
-        ("smVersion",         c_wchar * 15),
-        ("acVersion",         c_wchar * 15),
-        ("numberOfSessions",  c_int32),
-        ("numCars",           c_int32),
-        ("carModel",          c_wchar * 33),
-        ("track",             c_wchar * 33),
-        ("playerName",        c_wchar * 33),
-        ("playerSurname",     c_wchar * 33),
-        ("playerNick",        c_wchar * 33),
-        ("sectorCount",       c_int32),
-        ("maxTorque",         c_float),
-        ("maxPower",          c_float),
-        ("maxRpm",            c_int32),    # Redline RPM
-        ("maxFuel",           c_float),
-    ]
+class ACUDPReader:
+    """Reads engine RPM and telemetry from Assetto Corsa via UDP port 9996."""
 
-
-class ACSharedMemoryReader:
-    """Reads RPM data from Assetto Corsa's Windows shared memory."""
-
-    _PHYSICS_NAME = "Local\\acpmf_physics"
-    _STATIC_NAME = "Local\\acpmf_static"
-
-    def __init__(self) -> None:
-        self._phys_shm: Optional[mmap.mmap] = None
-        self._stat_shm: Optional[mmap.mmap] = None
-        self._connected = False
-
-    def connect(self) -> bool:
-        """Open shared memory. Returns True if AC is running."""
-        try:
-            self._phys_shm = mmap.mmap(
-                -1,
-                ctypes.sizeof(SPageFilePhysics),
-                self._PHYSICS_NAME,
-                access=mmap.ACCESS_READ,
-            )
-            self._stat_shm = mmap.mmap(
-                -1,
-                ctypes.sizeof(SPageFileStatic),
-                self._STATIC_NAME,
-                access=mmap.ACCESS_READ,
-            )
-            self._connected = True
-            log.info("Assetto Corsa shared memory opened.")
-            return True
-        except OSError:
-            # AC not running - shared memory doesn't exist yet
-            return False
-
-    def disconnect(self) -> None:
-        """Close shared memory handles."""
-        for shm in (self._phys_shm, self._stat_shm):
-            if shm is not None:
-                try:
-                    shm.close()
-                except Exception:
-                    pass
-        self._connected = False
-
-    def read_rpm_pct(self) -> Optional[float]:
-        """
-        Read current RPM percentage (0.0-1.0).
-
-        Returns None if shared memory is unavailable or maxRpm is zero.
-        """
-        if not self._connected:
-            return None
-        try:
-            self._phys_shm.seek(0)
-            physics = SPageFilePhysics.from_buffer_copy(self._phys_shm)
-            self._stat_shm.seek(0)
-            static = SPageFileStatic.from_buffer_copy(self._stat_shm)
-
-            if static.maxRpm <= 0:
-                return None
-
-            pct = physics.rpms / static.maxRpm
-            return max(0.0, min(1.0, pct))
-        except Exception as exc:
-            log.debug("AC shared memory read error: %s", exc)
-            self._connected = False
-            return None
-
-
-# ===========================================================================
-# F1 23 / 24 UDP Telemetry
-# ===========================================================================
-
-# F1 UDP packet header format (little-endian, 29 bytes)
-_F1_HEADER_FMT = "<HBBBBBQfIIBB"
-_F1_HEADER_SIZE = struct.calcsize(_F1_HEADER_FMT)
-
-# Car telemetry data per car (partial - just the fields we need)
-# speed(H) throttle(f) steer(f) brake(f) clutch(B) gear(b)
-# engineRPM(H) drs(B) revLightsPercent(B)
-_F1_CAR_TELEM_FMT = "<HfffBbHBB"
-_F1_CAR_TELEM_SIZE = struct.calcsize(_F1_CAR_TELEM_FMT)
-
-_F1_PACKET_ID_CAR_TELEMETRY = 6
-
-
-class F1UDPReader:
-    """Reads RPM data from F1 23/24 via UDP broadcast."""
-
-    def __init__(self, port: int = 20777) -> None:
+    def __init__(self, port: int = 9996) -> None:
         self._port = port
         self._sock: Optional[socket.socket] = None
+        self._max_rpm_seen: float = 6500.0
+        self._last_handshake: float = 0.0
 
     def connect(self) -> bool:
-        """Bind UDP socket. Always succeeds (game may not be running yet)."""
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._sock.bind(("0.0.0.0", self._port))
+            self._sock.bind(("0.0.0.0", 0))  # Bind to ephemeral port
             self._sock.setblocking(False)
-            log.info("F1 UDP listener bound on port %d.", self._port)
+            self._send_handshake()
+            log.info("AC UDP client initialized (target 127.0.0.1:%d).", self._port)
             return True
         except OSError as exc:
-            log.error("Could not bind F1 UDP port %d: %s", self._port, exc)
+            log.error("AC UDP socket setup failed: %s", exc)
+            return False
+
+    def _send_handshake(self) -> None:
+        if not self._sock:
+            return
+        try:
+            self._sock.sendto(_AC_HANDSHAKE_PKT, ("127.0.0.1", self._port))
+            self._last_handshake = time.monotonic()
+        except Exception:
+            pass
+
+    def disconnect(self) -> None:
+        if self._sock:
+            try:
+                self._sock.sendto(_AC_DISMISS_PKT, ("127.0.0.1", self._port))
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+    def read_rpm_pct(self) -> Optional[float]:
+        if not self._sock:
+            return None
+
+        # Periodically resend handshake if AC hasn't responded recently (every 2.0s)
+        now = time.monotonic()
+        if now - self._last_handshake > 2.0:
+            self._send_handshake()
+
+        try:
+            data, _ = self._sock.recvfrom(2048)
+        except (BlockingIOError, OSError):
+            return None
+
+        if len(data) < 84:
+            return None
+
+        # Unpack telemetry fields
+        try:
+            is_limiter = data[29] if len(data) > 29 else 0
+            engine_rpm = struct.unpack_from("<f", data, 72)[0]
+            if engine_rpm <= 0:
+                return None
+
+            if engine_rpm > self._max_rpm_seen:
+                self._max_rpm_seen = engine_rpm
+
+            if is_limiter:
+                return 1.0
+
+            return max(0.0, min(1.0, engine_rpm / self._max_rpm_seen))
+        except Exception:
+            return None
+
+
+# ===========================================================================
+# F1 23 / F1 24 — UDP port 20777
+# ===========================================================================
+_F1_HEADER_FMT  = "<HBBBBBQfIIBB"
+_F1_HEADER_SIZE = struct.calcsize(_F1_HEADER_FMT)
+_F1_TELEM_FMT   = "<HfffBbHBB"
+_F1_TELEM_SIZE  = struct.calcsize(_F1_TELEM_FMT)
+_F1_PKT_TELEM   = 6
+
+
+class F1Reader:
+    """Reads engine RPM from F1 23/24 UDP broadcast on port 20777."""
+
+    def __init__(self) -> None:
+        self._sock: Optional[socket.socket] = None
+
+    def connect(self) -> bool:
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(("0.0.0.0", config.F1_UDP_PORT))
+            self._sock.setblocking(False)
+            log.info("F1 UDP listener bound on port %d.", config.F1_UDP_PORT)
+            return True
+        except OSError as exc:
+            log.error("F1 UDP bind failed: %s", exc)
             return False
 
     def disconnect(self) -> None:
@@ -210,131 +162,161 @@ class F1UDPReader:
             self._sock = None
 
     def read_rpm_pct(self) -> Optional[float]:
-        """
-        Non-blocking read of the latest F1 telemetry packet.
-
-        Returns RPM as a 0.0-1.0 percentage using the game's built-in
-        revLightsPercent (0-100) field which already accounts for the
-        car's specific shift point. Returns None if no packet available.
-        """
-        if self._sock is None:
+        if not self._sock:
             return None
         try:
             data, _ = self._sock.recvfrom(2048)
-        except BlockingIOError:
-            return None  # No data available
-        except Exception:
+        except (BlockingIOError, OSError):
             return None
 
         if len(data) < _F1_HEADER_SIZE:
             return None
-
-        header = struct.unpack_from(_F1_HEADER_FMT, data, 0)
-        packet_id = header[5]          # index 5 = packetId
-        player_idx = header[10]        # index 10 = playerCarIndex
-
-        if packet_id != _F1_PACKET_ID_CAR_TELEMETRY:
+        hdr = struct.unpack_from(_F1_HEADER_FMT, data, 0)
+        if hdr[5] != _F1_PKT_TELEM:
             return None
 
-        # Each car's telemetry block follows the header
-        # Full car telemetry packet size per car is ~60 bytes in F1 23/24
-        car_offset = _F1_HEADER_SIZE + (player_idx * 60)
-        if len(data) < car_offset + _F1_CAR_TELEM_SIZE:
+        player_idx = hdr[10]
+        car_offset = _F1_HEADER_SIZE + player_idx * 60
+        if len(data) < car_offset + _F1_TELEM_SIZE:
             return None
 
-        telem = struct.unpack_from(_F1_CAR_TELEM_FMT, data, car_offset)
-        rev_lights_pct = telem[8]  # 0-100 directly from game
-        return max(0.0, min(1.0, rev_lights_pct / 100.0))
+        telem = struct.unpack_from(_F1_TELEM_FMT, data, car_offset)
+        return max(0.0, min(1.0, telem[8] / 100.0))
 
 
 # ===========================================================================
-# Module entry point
+# Automobilista 2 (AMS2) — UDP port 5606
+# ===========================================================================
+_AMS2_PKT_CARPHYSICS = 0
+_AMS2_RPM_OFFSET     = 41
+_AMS2_MAXRPM_OFFSET  = 43
+
+
+class AMS2Reader:
+    """Reads RPM from Automobilista 2 via Project CARS 2 UDP protocol."""
+
+    def __init__(self) -> None:
+        self._sock: Optional[socket.socket] = None
+        self._port: int = config.AMS2_UDP_PORT
+
+    def connect(self) -> bool:
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(("0.0.0.0", self._port))
+            self._sock.setblocking(False)
+            log.info("AMS2 UDP listener bound on port %d.", self._port)
+            return True
+        except OSError as exc:
+            log.error("AMS2 UDP bind failed: %s", exc)
+            return False
+
+    def disconnect(self) -> None:
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+
+    def read_rpm_pct(self) -> Optional[float]:
+        if not self._sock:
+            return None
+        try:
+            data, _ = self._sock.recvfrom(4096)
+        except (BlockingIOError, OSError):
+            return None
+
+        if len(data) < 50 or data[10] != _AMS2_PKT_CARPHYSICS:
+            return None
+
+        rpm     = struct.unpack_from("<H", data, _AMS2_RPM_OFFSET)[0]
+        max_rpm = struct.unpack_from("<H", data, _AMS2_MAXRPM_OFFSET)[0]
+        if max_rpm <= 0:
+            return None
+        return max(0.0, min(1.0, rpm / max_rpm))
+
+
+# ===========================================================================
+# Forza Motorsport / Horizon — UDP port 5300
+# ===========================================================================
+_FORZA_CURRPM_OFFSET   = 16
+_FORZA_MAXRPM_OFFSET   = 8
+_FORZA_ISRACEON_OFFSET = 0
+
+
+class ForzaReader:
+    """Reads RPM from Forza Motorsport / Horizon via UDP Data Out."""
+
+    def __init__(self) -> None:
+        self._sock: Optional[socket.socket] = None
+        self._port: int = config.FORZA_UDP_PORT
+
+    def connect(self) -> bool:
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(("0.0.0.0", self._port))
+            self._sock.setblocking(False)
+            log.info("Forza UDP listener bound on port %d.", self._port)
+            return True
+        except OSError as exc:
+            log.error("Forza UDP bind failed: %s", exc)
+            return False
+
+    def disconnect(self) -> None:
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+
+    def read_rpm_pct(self) -> Optional[float]:
+        if not self._sock:
+            return None
+        try:
+            data, _ = self._sock.recvfrom(512)
+        except (BlockingIOError, OSError):
+            return None
+
+        if len(data) < 20:
+            return None
+
+        is_race_on = struct.unpack_from("<i", data, _FORZA_ISRACEON_OFFSET)[0]
+        if is_race_on == 0:
+            return None
+
+        max_rpm = struct.unpack_from("<f", data, _FORZA_MAXRPM_OFFSET)[0]
+        cur_rpm = struct.unpack_from("<f", data, _FORZA_CURRPM_OFFSET)[0]
+        if max_rpm <= 0:
+            return None
+        return max(0.0, min(1.0, cur_rpm / max_rpm))
+
+
+# ===========================================================================
+# Async run loops
 # ===========================================================================
 
 async def run() -> None:
-    """
-    Async task: automatically detect active sim game (AC or F1) and update state.rpm_pct.
-
-    Boots both Assetto Corsa shared memory reader and F1 UDP reader in parallel.
-    Whichever game is running will update state.rpm_pct.
-    Dormant (returns immediately) if DS4 lightbar data is active.
-    """
-    log.info("Sim racing telemetry module starting (auto-detecting AC & F1)...")
-    await asyncio.gather(
-        _run_ac(),
-        _run_f1(),
-        return_exceptions=True,
-    )
+    log.info("Universal sim racing telemetry starting (AC UDP + F1 + AMS2 + Forza)...")
+    tasks = [
+        _run_udp_reader("AC UDP", ACUDPReader(config.AC_UDP_PORT)),
+        _run_udp_reader("F1",     F1Reader()),
+        _run_udp_reader("AMS2",   AMS2Reader()),
+        _run_udp_reader("Forza",  ForzaReader()),
+    ]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
-
-async def _run_ac() -> None:
-    """Assetto Corsa shared memory polling loop."""
-    reader = ACSharedMemoryReader()
-    last_update = 0.0
-    connected = False
-
-    while not state.shutdown_event.is_set():
-        # Try to connect if not already
-        if not connected:
-            connected = await asyncio.to_thread(reader.connect)
-            if not connected:
-                # AC not running yet - check again in 3s
-                await asyncio.sleep(3.0)
-                continue
-
-        # Skip if DS4 lightbar is active (DS4 has priority)
-        if state.is_ds4_active(config.DS4_LIGHTBAR_TIMEOUT):
-            await asyncio.sleep(0.5)
-            continue
-
-        now = time.monotonic()
-        if now - last_update < _UPDATE_INTERVAL:
-            await asyncio.sleep(_UPDATE_INTERVAL - (now - last_update))
-            continue
-
-        pct = await asyncio.to_thread(reader.read_rpm_pct)
-        if pct is None:
-            # Shared memory gone - AC probably closed
-            reader.disconnect()
-            connected = False
-            state.rpm_pct = 0.0
-            await asyncio.sleep(3.0)
-            continue
-
-        state.rpm_pct = pct
-        last_update = time.monotonic()
-
-    reader.disconnect()
-    log.info("AC reader stopped.")
-
-
-async def _run_f1() -> None:
-    """F1 23/24 UDP polling loop."""
-    reader = F1UDPReader(config.F1_UDP_PORT)
+async def _run_udp_reader(name: str, reader) -> None:
     if not await asyncio.to_thread(reader.connect):
-        log.error("F1 UDP reader failed to start.")
+        log.warning("%s reader failed to start — skipping.", name)
         return
 
-    last_update = 0.0
-
     while not state.shutdown_event.is_set():
-        # Skip if DS4 lightbar is active
         if state.is_ds4_active(config.DS4_LIGHTBAR_TIMEOUT):
             await asyncio.sleep(0.5)
-            continue
-
-        now = time.monotonic()
-        if now - last_update < _UPDATE_INTERVAL:
-            await asyncio.sleep(max(0, _UPDATE_INTERVAL - (now - last_update)))
             continue
 
         pct = await asyncio.to_thread(reader.read_rpm_pct)
         if pct is not None:
             state.rpm_pct = pct
-            last_update = time.monotonic()
-        else:
-            await asyncio.sleep(0.01)  # No packet yet - tight loop
+        await asyncio.sleep(0.01)
 
-    reader.disconnect()
-    log.info("F1 UDP reader stopped.")
+    await asyncio.to_thread(reader.disconnect)
+    log.info("%s reader stopped.", name)

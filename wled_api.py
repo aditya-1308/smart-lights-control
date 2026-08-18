@@ -227,17 +227,17 @@ class WLEDClient:
                 "seg": [{"id": config.SEG1_ID, "on": True, "fx": 0, "i": i_array}]
             })
 
-        # Dual-segment lightbar (e.g. Seg 2 = left, Seg 1 = right)
-        seg2_colors = color_array[:config.SEG2_COUNT]           # 0..17 → Seg 2
-        seg1_colors = color_array[config.SEG2_COUNT:][::-1]     # 18..34 → reversed for Seg 1
+        # Dual-segment lightbar: Seg 1 = left half (0..17), Seg 2 = right half (18..35)
+        seg1_colors = color_array[:config.SEG1_COUNT]
+        seg2_colors = color_array[config.SEG1_COUNT:]
 
-        seg2_i = _build_per_led_i_array(seg2_colors)
         seg1_i = _build_per_led_i_array(seg1_colors)
+        seg2_i = _build_per_led_i_array(seg2_colors)
 
         return await self.send_state({
             "seg": [
-                {"id": config.SEG2_ID, "on": True, "fx": 0, "i": seg2_i},
                 {"id": config.SEG1_ID, "on": True, "fx": 0, "i": seg1_i},
+                {"id": config.SEG2_ID, "on": True, "fx": 0, "i": seg2_i},
             ]
         })
 

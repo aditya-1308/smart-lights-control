@@ -1,8 +1,16 @@
 """
 config.py - Central configuration for RoomLights.
 
-Reads all settings from a .env file in the project root.
-Every other module imports from here - never reads os.environ directly.
+Physical WS2812B LED strip layout (total 150 LEDs):
+  - Segment 1 (LEDs 0 - 17, 18 LEDs)   : Left bottom horizontal loop (left half of lightbar)
+  - Segment 0 (LEDs 17 - 126, 109 LEDs): Whiteboard perimeter (bottom-left -> top-left -> top-right -> bottom-right)
+  - Segment 2 (LEDs 126 - 144, 18 LEDs): Right bottom horizontal loop (right half of lightbar)
+  - Segment 3 (LEDs 144 - 150, 6 LEDs) : Wall Pomodoro timer
+
+WLED Realtime Configuration:
+  - "Use main segment only" enabled in WLED with Segment 0 as Main Segment.
+  - Seg 0 receives UDP DNRGB frames directly on Port 21324.
+  - Segments 1, 2, 3 update via HTTP JSON API (/json/state) with partial payloads.
 """
 
 import os
@@ -10,7 +18,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Load .env from project root (same directory as this file)
+# Load .env from project root
 # ---------------------------------------------------------------------------
 _env_path = Path(__file__).resolve().parent / ".env"
 if not _env_path.exists():
@@ -20,12 +28,10 @@ load_dotenv(dotenv_path=_env_path, override=True)
 
 
 def _get(key: str, default: str = "") -> str:
-    """Read an env var with a fallback default."""
     return os.getenv(key, default)
 
 
 def _int(key: str, default: int = 0) -> int:
-    """Read an env var as an integer."""
     try:
         return int(os.getenv(key, str(default)))
     except ValueError:
@@ -33,7 +39,6 @@ def _int(key: str, default: int = 0) -> int:
 
 
 def _float(key: str, default: float = 0.0) -> float:
-    """Read an env var as a float."""
     try:
         return float(os.getenv(key, str(default)))
     except ValueError:
@@ -44,52 +49,42 @@ def _float(key: str, default: float = 0.0) -> float:
 # WLED
 # ===================================================================
 WLED_IP: str = _get("WLED_IP", "192.168.1.100")
-WLED_PORT: int = 80  # HTTP API port (fixed by WLED firmware)
+WLED_PORT: int = 80          # HTTP API port (fixed by WLED firmware)
+WLED_UDP_PORT: int = 21324   # WLED Realtime UDP DNRGB port
 WLED_BASE_URL: str = f"http://{WLED_IP}:{WLED_PORT}"
 WLED_STATE_URL: str = f"{WLED_BASE_URL}/json/state"
-WLED_TIMEOUT: float = 1.0  # seconds - silently drop on timeout
+WLED_TIMEOUT: float = 1.0    # seconds
 
 # ---------------------------------------------------------------------------
 # Segment definitions - physical LED layout
 # ---------------------------------------------------------------------------
-# Seg 0: 109 LEDs - screen edge ambient / spatial game effects
-#   Clockwise from bottom-middle:
-#   idx  0-17  : bottom-right (18 LEDs, center → right corner)
-#   idx 18-35  : right edge   (18 LEDs, bottom-right → top-right)
-#   idx 36-71  : top edge     (36 LEDs, top-right → top-left)
-#   idx 72-89  : left edge    (18 LEDs, top-left → bottom-left)
-#   idx 90-108 : bottom-left  (19 LEDs, bottom-left → center)
+# Seg 0: 109 LEDs (physical 17..126) - Screen ambient display
+#   Counter-clockwise perimeter from bottom-left:
+#   idx  0-17  : Left edge   (18 LEDs, bottom-left  -> top-left)
+#   idx 18-53  : Top edge    (36 LEDs, top-left     -> top-right)
+#   idx 54-71  : Right edge  (18 LEDs, top-right    -> bottom-right)
+#   idx 72-108 : Bottom edge (37 LEDs, bottom-right -> bottom-left)
 #
-# Seg 1:  17 LEDs - right half of lightbar (runs R→L, idx 0 = far right)
-# Seg 2:  18 LEDs - left half of lightbar  (runs L→R, idx 0 = far left)
-# Seg 3:   6 LEDs - Pomodoro bar (vertical on wall, top→bottom)
+# Seg 1: 18 LEDs (physical 0..17)    - Left half of unified lightbar
+# Seg 2: 18 LEDs (physical 126..144) - Right half of unified lightbar
+# Seg 3:  6 LEDs (physical 144..150) - Pomodoro wall strip (-1 to disable)
 #
-# Seg 1 + Seg 2 = one unified 35-LED logical bar.
-# Segment IDs (configurable via .env, default: 0, 1, 2, 3)
-SEG0_ID: int = _int("SEGMENT_SCREEN_CAPTURE", 0)   # Screen capture / spatial effects
-SEG1_ID: int = _int("SEGMENT_LIGHTBAR_RIGHT", 1)   # Right lightbar half (wired R->L)
-SEG2_ID: int = _int("SEGMENT_LIGHTBAR_LEFT", 2)    # Left lightbar half (wired L->R)
-SEG3_ID: int = _int("SEGMENT_POMODORO", 3)         # Pomodoro wall strip (-1 to disable)
-
-# Optional single-segment lightbar override: SEGMENT_LIGHTBAR=1 in .env
-_SEG_LIGHTBAR: int = _int("SEGMENT_LIGHTBAR", -1)
-if _SEG_LIGHTBAR >= 0:
-    SEG1_ID = _SEG_LIGHTBAR
-    SEG2_ID = _SEG_LIGHTBAR
-
+SEG0_ID: int = _int("SEGMENT_SCREEN_CAPTURE", 0)   # Screen ambient (Main segment on UDP)
+SEG1_ID: int = _int("SEGMENT_LIGHTBAR_LEFT", 1)    # Left lightbar half (LEDs 0..17)
+SEG2_ID: int = _int("SEGMENT_LIGHTBAR_RIGHT", 2)   # Right lightbar half (LEDs 126..144)
+SEG3_ID: int = _int("SEGMENT_POMODORO", 3)         # Pomodoro timer (LEDs 144..150)
 
 SEG0_COUNT: int = 109
-SEG0_BOTTOM_RIGHT: tuple = (0, 18)    # idx 0-17,  18 LEDs
-SEG0_RIGHT: tuple = (18, 36)           # idx 18-35, 18 LEDs
-SEG0_TOP: tuple = (36, 72)             # idx 36-71, 36 LEDs
-SEG0_LEFT: tuple = (72, 90)            # idx 72-89, 18 LEDs
-SEG0_BOTTOM_LEFT: tuple = (90, 109)    # idx 90-108, 19 LEDs
-
-SEG1_COUNT: int = 17
+SEG1_COUNT: int = 18
 SEG2_COUNT: int = 18
 SEG3_COUNT: int = 6
-LIGHTBAR_TOTAL: int = SEG2_COUNT + SEG1_COUNT  # 35
+LIGHTBAR_TOTAL: int = SEG1_COUNT + SEG2_COUNT  # 36 LEDs logical bar (0..17 left, 18..35 right)
 
+# Seg 0 edge slice indices (109 total)
+SEG0_LEFT: tuple   = (0, 18)     # idx 0-17  (18 LEDs)
+SEG0_TOP: tuple    = (18, 54)    # idx 18-53 (36 LEDs)
+SEG0_RIGHT: tuple  = (54, 72)    # idx 54-71 (18 LEDs)
+SEG0_BOTTOM: tuple = (72, 109)   # idx 72-108 (37 LEDs)
 
 # ===================================================================
 # Tuya Ceiling Light
@@ -106,38 +101,40 @@ CS2_GSI_PORT: int = _int("CS2_GSI_PORT", 3000)
 CS2_GSI_TOKEN: str = _get("CS2_GSI_TOKEN", "roomlights_secret_token_123")
 
 # ===================================================================
-# Sim Racing (Auto-detects Assetto Corsa & F1 23/24)
+# Sim Racing Telemetry Ports (100% UDP - zero shared memory crashes)
 # ===================================================================
-F1_UDP_PORT: int = _int("F1_UDP_PORT", 20777)
-
+SIM_GAME: str = _get("SIM_GAME", "auto")  # auto | ac | acc | f1 | ams2 | forza | iracing
+AC_UDP_PORT:    int = _int("AC_UDP_PORT",    9996)   # Assetto Corsa native UDP port
+F1_UDP_PORT:    int = _int("F1_UDP_PORT",    20777)  # F1 23/24 UDP port
+AMS2_UDP_PORT:  int = _int("AMS2_UDP_PORT",  5606)   # AMS2 / PCARS2 UDP port
+FORZA_UDP_PORT: int = _int("FORZA_UDP_PORT", 5300)   # Forza Data Out UDP port
 
 # ---------------------------------------------------------------------------
-# Rev meter thresholds - tune per car / preference
+# Rev meter thresholds (for 36-LED logical bar: 0..17 left, 18..35 right)
 # ---------------------------------------------------------------------------
-REV_START_PCT: float = 0.28    # below this = dark (no indication)
-REV_GREEN_PCT: float = 0.50    # green tips fully lit
-REV_YELLOW_PCT: float = 0.68   # yellow zone fully in, approaching shift
-REV_FULL_PCT: float = 0.82     # entire strip lit = past optimal shift point
-REV_LIMITER_PCT: float = 0.93  # blue flash starts (limiter territory)
-REV_FLASH_HZ: int = 4          # blue flash frequency in Hz
+REV_START_PCT: float = 0.28
+REV_GREEN_PCT: float = 0.50
+REV_YELLOW_PCT: float = 0.68
+REV_FULL_PCT: float = 0.82
+REV_LIMITER_PCT: float = 0.93
+REV_FLASH_HZ: int = 4
 
-# Rev meter zone boundaries on the 35-LED logical bar
-# Zone colors are fixed by position; fill level determines how many are lit.
-REV_GREEN_ZONE = list(range(0, 7)) + list(range(28, 35))   # 14 LEDs (outer)
-REV_YELLOW_ZONE = list(range(7, 16)) + list(range(19, 28))  # 18 LEDs (inner)
-REV_RED_ZONE = list(range(16, 19))                           # 3 LEDs  (center)
+# Outer -> Inner rev meter layout on 36-LED bar:
+REV_GREEN_ZONE  = list(range(0, 7)) + list(range(29, 36))    # outer tips
+REV_YELLOW_ZONE = list(range(7, 16)) + list(range(20, 29))   # middle
+REV_RED_ZONE    = list(range(16, 20))                         # center 4 LEDs
 
 # ===================================================================
 # DS4 Virtual Controller
 # ===================================================================
-DS4_LIGHTBAR_TIMEOUT: float = 3.0  # seconds of no data → fallback to rev meter
+DS4_LIGHTBAR_TIMEOUT: float = 3.0
 
 # ===================================================================
 # Pomodoro Timer
 # ===================================================================
 POMODORO_DURATION_MIN: int = _int("POMODORO_DURATION_MIN", 25)
 POMODORO_DURATION_SEC: int = POMODORO_DURATION_MIN * 60
-POMODORO_UPDATE_INTERVAL: float = 2.0  # seconds between WLED updates
+POMODORO_UPDATE_INTERVAL: float = 2.0
 
 # ===================================================================
 # Tuya Ambient Context Colors
@@ -149,40 +146,39 @@ TUYA_CONTEXT_MAP: dict = {
     "racing":       {"rgb": (255, 160,  60), "brightness": 60},
     "generic_game": {"rgb": (100, 100, 180), "brightness": 50},
 }
-TUYA_CROSSFADE_DURATION: float = 2.0   # seconds
-TUYA_CROSSFADE_STEPS: int = 20          # interpolation steps
+TUYA_CROSSFADE_DURATION: float = 2.0
+TUYA_CROSSFADE_STEPS: int = 20
 
 # ===================================================================
 # General
 # ===================================================================
-LIGHTBAR_UPDATE_HZ: int = 30  # max updates/sec to WLED for the lightbar
+LIGHTBAR_UPDATE_HZ: int = 30
 
 # ===================================================================
-# Screen Capture (replaces Prismatik for Seg 0)
+# Screen Capture (Seg 0 Realtime UDP)
 # ===================================================================
-SCREEN_CAPTURE_FPS: int = _int("SCREEN_CAPTURE_FPS", 24)
-SCREEN_EDGE_DEPTH_PCT: float = 0.08  # 8% of screen dimension for edge strip
-SCREEN_DOWNSCALE_WIDTH: int = 320     # downscale target for performance
-SCREEN_DOWNSCALE_HEIGHT: int = 180
+SCREEN_CAPTURE_FPS: int = _int("SCREEN_CAPTURE_FPS", 30)
+SCREEN_CAPTURE_GAMMA: float = _float("SCREEN_CAPTURE_GAMMA", 1.8)
+SCREEN_CAPTURE_SATURATION: float = _float("SCREEN_CAPTURE_SATURATION", 1.3)
+SCREEN_CAPTURE_SWAP_RGB: bool = _get("SCREEN_CAPTURE_SWAP_RGB", "false").lower() in ("true", "1", "yes")
 
 # ===================================================================
-# Chroma SDK Bridge (intercepts 150+ games' RGB data)
+# Chroma SDK Bridge
 # ===================================================================
 CHROMA_PORT: int = 54235
-CHROMA_HEARTBEAT_TIMEOUT: float = 5.0  # seconds without heartbeat → session dead
+CHROMA_HEARTBEAT_TIMEOUT: float = 5.0
 
 # ===================================================================
-# Smart ROI (directional damage, minimap, health bar detection)
+# Smart ROI
 # ===================================================================
-ROI_DAMAGE_MARGIN_PCT: float = 0.15   # inner margin for damage vignette detection
-ROI_DAMAGE_DEPTH_PCT: float = 0.10    # depth of detection strips
-ROI_RED_THRESHOLD: int = 150          # red channel threshold for damage flash
-ROI_RED_DOMINANCE: float = 1.5        # R must be this much > G and B
+ROI_DAMAGE_MARGIN_PCT: float = 0.15
+ROI_DAMAGE_DEPTH_PCT: float = 0.10
+ROI_RED_THRESHOLD: int = 150
+ROI_RED_DOMINANCE: float = 1.5
 
 # ===================================================================
-# Keybinds / Hotkeys (pynput format, configurable via .env)
+# Keybinds
 # ===================================================================
 KEYBIND_TUYA_TOGGLE: str = _get("KEYBIND_TUYA_TOGGLE", "<ctrl>+<shift>+l")
 KEYBIND_TUYA_BRIGHTNESS_UP: str = _get("KEYBIND_TUYA_BRIGHTNESS_UP", "<ctrl>+<shift>+<up>")
 KEYBIND_TUYA_BRIGHTNESS_DOWN: str = _get("KEYBIND_TUYA_BRIGHTNESS_DOWN", "<ctrl>+<shift>+<down>")
-

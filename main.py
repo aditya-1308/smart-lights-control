@@ -44,7 +44,6 @@ import mod_d_pomodoro
 import mod_e_tuya
 
 # Phase 2 modules
-import mod_seg0_router
 import mod_screen_capture
 import mod_chroma_bridge
 import mod_spatial_ac
@@ -83,7 +82,7 @@ async def main() -> None:
     log.info("  Seg 0 screen capture: %d FPS", config.SCREEN_CAPTURE_FPS)
     log.info("  Chroma bridge:        port %d", config.CHROMA_PORT)
     log.info("  CS2 GSI:              port %d", config.CS2_GSI_PORT)
-    log.info("  Sim game:             %s", config.SIM_GAME)
+    log.info("  Sim racing:           %s", config.SIM_GAME)
     log.info("=" * 60)
 
     # Register OS signals for graceful shutdown (Ctrl+C / task kill)
@@ -136,12 +135,9 @@ async def main() -> None:
 
         tasks.extend([
             # ----------------------------------------------------------
-            # Phase 2: Seg 0 (109 LEDs) spatial system
+            # Phase 2: Seg 0 (109 LEDs) realtime UDP spatial system
             # ----------------------------------------------------------
-            # Router: reads state.seg0_colors and sends to WLED at target FPS
-            asyncio.create_task(mod_seg0_router.run(wled),   name="seg0_router"),
-
-            # Screen capture: edge ambient - lowest priority fallback
+            # Screen capture: edge ambient via realtime UDP to Seg 0
             asyncio.create_task(mod_screen_capture.run(),    name="screen_capture"),
 
             # Chroma bridge: intercepts 150+ games' RGB data

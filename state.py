@@ -88,7 +88,12 @@ class SharedState:
         # -- Seg 0 (109 LEDs) --
         self.seg0_source: Seg0Source = Seg0Source.SCREEN_CAPTURE
         self.seg0_colors: List[tuple] = [(0, 0, 0)] * 109  # current 109-LED frame
-        self.seg0_dirty: bool = False      # True when colors updated, cleared after send
+
+        # -- Lightbar (35 LEDs logical: Seg 1 + Seg 2) --
+        self.lightbar_colors: List[tuple] = [(0, 0, 0)] * 35
+
+        # -- Strip dirty flag: compositor sends when True --
+        self.strip_dirty: bool = False
 
         # -- Chroma bridge --
         self.chroma_active: bool = False
@@ -99,6 +104,9 @@ class SharedState:
 
         # -- Shutdown --
         self.shutdown_event: asyncio.Event = asyncio.Event()
+
+        # -- Shared screen frame (written by mod_screen_capture, read by mod_smart_roi) --
+        self.latest_frame: Optional[object] = None  # numpy ndarray or None
 
     def set_discovered_segments(self, seg_dict: dict) -> None:
         """Store discovered segment metadata from WLED."""
@@ -172,7 +180,13 @@ class SharedState:
         """Update the 109-LED Seg 0 color buffer (thread-safe)."""
         with self._thread_lock:
             self.seg0_colors = colors
-            self.seg0_dirty = True
+            self.strip_dirty = True
+
+    def update_lightbar_colors(self, colors: List[tuple]) -> None:
+        """Update the 35-LED lightbar color buffer (thread-safe)."""
+        with self._thread_lock:
+            self.lightbar_colors = colors
+            self.strip_dirty = True
 
 
 # ---------------------------------------------------------------------------
