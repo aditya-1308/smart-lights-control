@@ -311,15 +311,14 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// Render 36-LED Outer-to-Inner Telemetry Rev Meter into UDP Packet Buffer
+// Render 35-LED Outer-to-Inner Telemetry Rev Meter into UDP Packet Buffer
 // ---------------------------------------------------------------------------
 static void render_rev_meter(std::vector<uint8_t>& pkt, float rpm_pct, bool is_limiter, bool flash_state) {
-    // 36 logical LEDs: Seg 1 (LEDs 0..17), Seg 2 (LEDs 126..143)
+    // Seg 1 (LEDs 0..16, 17 LEDs) and Seg 2 (LEDs 126..143, 18 LEDs)
     const float REV_START_PCT = 0.28f;
     const float REV_FULL_PCT  = 0.82f;
 
     uint8_t r = 0, g = 0, b = 0;
-
     if (is_limiter || rpm_pct >= 0.93f) {
         if (flash_state) {
             r = 0; g = 100; b = 255; // Flashing Blue on limiter
@@ -328,32 +327,38 @@ static void render_rev_meter(std::vector<uint8_t>& pkt, float rpm_pct, bool is_l
 
     float span = REV_FULL_PCT - REV_START_PCT;
     float norm = (span > 0.0f) ? max(0.0f, min(1.0f, (rpm_pct - REV_START_PCT) / span)) : 0.0f;
-    int lit_per_side = (int)std::round(norm * 18.0f);
+    int lit_left  = (int)std::round(norm * 17.0f);
+    int lit_right = (int)std::round(norm * 18.0f);
 
-    for (int i = 0; i < 18; i++) {
-        // Left side (Seg 1: LEDs 0..17)
+    // Left side (Seg 1: LEDs 0..16)
+    for (int i = 0; i < 17; i++) {
         int seg1_idx = 4 + i * 3;
-        // Right side (Seg 2: LEDs 126..143)
-        int seg2_idx = 4 + (126 + (17 - i)) * 3;
-
-        if (i < lit_per_side) {
+        if (i < lit_left) {
             uint8_t cr = 0, cg = 0, cb = 0;
-            if (is_limiter || rpm_pct >= 0.93f) {
-                cr = r; cg = g; cb = b;
-            } else if (i < 7) {
-                cr = 0; cg = 255; cb = 0;    // Green outer tip
-            } else if (i < 16) {
-                cr = 255; cg = 165; cb = 0;  // Yellow middle
-            } else {
-                cr = 255; cg = 0; cb = 0;    // Red center
-            }
+            if (is_limiter || rpm_pct >= 0.93f) { cr = r; cg = g; cb = b; }
+            else if (i < 6)  { cr = 0; cg = 255; cb = 0; }
+            else if (i < 15) { cr = 255; cg = 165; cb = 0; }
+            else             { cr = 255; cg = 0; cb = 0; }
 
-            pkt[seg1_idx]     = cr; pkt[seg1_idx + 1]     = cg; pkt[seg1_idx + 2]     = cb;
-            pkt[seg2_idx]     = cr; pkt[seg2_idx + 1]     = cg; pkt[seg2_idx + 2]     = cb;
+            pkt[seg1_idx] = cr; pkt[seg1_idx + 1] = cg; pkt[seg1_idx + 2] = cb;
         } else {
-            // Off
-            pkt[seg1_idx]     = 0; pkt[seg1_idx + 1]     = 0; pkt[seg1_idx + 2]     = 0;
-            pkt[seg2_idx]     = 0; pkt[seg2_idx + 1]     = 0; pkt[seg2_idx + 2]     = 0;
+            pkt[seg1_idx] = 0;  pkt[seg1_idx + 1] = 0;  pkt[seg1_idx + 2] = 0;
+        }
+    }
+
+    // Right side (Seg 2: LEDs 126..143)
+    for (int i = 0; i < 18; i++) {
+        int seg2_idx = 4 + (126 + (17 - i)) * 3;
+        if (i < lit_right) {
+            uint8_t cr = 0, cg = 0, cb = 0;
+            if (is_limiter || rpm_pct >= 0.93f) { cr = r; cg = g; cb = b; }
+            else if (i < 7)  { cr = 0; cg = 255; cb = 0; }
+            else if (i < 16) { cr = 255; cg = 165; cb = 0; }
+            else             { cr = 255; cg = 0; cb = 0; }
+
+            pkt[seg2_idx] = cr; pkt[seg2_idx + 1] = cg; pkt[seg2_idx + 2] = cb;
+        } else {
+            pkt[seg2_idx] = 0;  pkt[seg2_idx + 1] = 0;  pkt[seg2_idx + 2] = 0;
         }
     }
 }
@@ -489,11 +494,13 @@ int main(int argc, char* argv[]) {
         if (ac_active && rpm_pct > 0.0f) {
             render_rev_meter(pkt, rpm_pct, is_limiter, flash_state);
         } else {
-            // Turn off Rev Meter (Seg 1 & 2) when not racing
-            for (int i = 0; i < 18; i++) {
+            // Turn off Rev Meter (Seg 1: 0..16 & Seg 2: 126..143) when not racing
+            for (int i = 0; i < 17; i++) {
                 int seg1_idx = 4 + i * 3;
-                int seg2_idx = 4 + (126 + (17 - i)) * 3;
                 pkt[seg1_idx] = pkt[seg1_idx+1] = pkt[seg1_idx+2] = 0;
+            }
+            for (int i = 0; i < 18; i++) {
+                int seg2_idx = 4 + (126 + (17 - i)) * 3;
                 pkt[seg2_idx] = pkt[seg2_idx+1] = pkt[seg2_idx+2] = 0;
             }
         }
