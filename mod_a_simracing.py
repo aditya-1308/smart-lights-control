@@ -61,6 +61,7 @@ class ACUDPReader:
         self._sock: Optional[socket.socket] = None
         self._max_rpm_seen: float = 6500.0
         self._last_handshake: float = 0.0
+        self._last_received: float = 0.0  # time of last valid telemetry packet
 
     def connect(self) -> bool:
         try:
@@ -97,9 +98,12 @@ class ACUDPReader:
         if not self._sock:
             return None
 
-        # Periodically resend handshake if AC hasn't responded recently (every 2.0s)
         now = time.monotonic()
-        if now - self._last_handshake > 2.0:
+        # Resend handshake every 0.5s when AC hasn't replied yet,
+        # or every 2s during active session (AC re-starts the stream on reconnect)
+        no_data_recently = (now - self._last_received) > 1.0
+        handshake_interval = 0.5 if no_data_recently else 2.0
+        if now - self._last_handshake > handshake_interval:
             self._send_handshake()
 
         try:
@@ -116,6 +120,8 @@ class ACUDPReader:
             engine_rpm = struct.unpack_from("<f", data, 72)[0]
             if engine_rpm <= 0:
                 return None
+
+            self._last_received = now  # mark that AC is actively sending
 
             if engine_rpm > self._max_rpm_seen:
                 self._max_rpm_seen = engine_rpm
@@ -308,14 +314,24 @@ async def _run_udp_reader(name: str, reader) -> None:
         log.warning("%s reader failed to start — skipping.", name)
         return
 
+    last_received = 0.0  # monotonic time of last successful rpm read
+    _STALE_TIMEOUT = 3.0  # seconds without data before resetting rpm_pct to 0
+
     while not state.shutdown_event.is_set():
         if state.is_ds4_active(config.DS4_LIGHTBAR_TIMEOUT):
             await asyncio.sleep(0.5)
             continue
 
         pct = await asyncio.to_thread(reader.read_rpm_pct)
+        now = time.monotonic()
         if pct is not None:
             state.rpm_pct = pct
+            last_received = now
+        else:
+            # No data from this reader — if stale across all readers, reset to 0
+            if last_received > 0 and (now - last_received) > _STALE_TIMEOUT:
+                state.rpm_pct = 0.0
+
         await asyncio.sleep(0.01)
 
     await asyncio.to_thread(reader.disconnect)

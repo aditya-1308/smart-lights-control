@@ -156,7 +156,11 @@ class LightbarRenderer:
             return
 
         ds4_on = state.is_ds4_active(config.DS4_LIGHTBAR_TIMEOUT)
-        racing = state.rpm_pct > config.REV_START_PCT
+        # REV_METER activates for ANY positive rpm from telemetry.
+        # rpm_pct > 0 means a sim racing game is actively sending data.
+        # The visual bar itself only lights up above REV_START_PCT — this is just
+        # the mode gate so the lightbar is owned by the rev meter while in a session.
+        racing = state.rpm_pct > 0.0
 
         if ds4_on:
             if mode != LightbarMode.DS4_ACTIVE:

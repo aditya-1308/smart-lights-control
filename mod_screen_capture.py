@@ -1,12 +1,14 @@
 """
-mod_screen_capture.py - Ultra-Low-Latency Realtime Screen Ambient Capture for Segment 0.
+mod_screen_capture.py - Low-Latency Realtime Screen Ambient Capture for Segment 0.
 
-Performance & Latency Optimizations:
-  - DXcam Desktop Duplication with max_buffer_len=1 (zero queue backlog).
-  - Windows High-Precision Timer (timeBeginPeriod(1) -> 1.0ms scheduler resolution).
-  - Direct 109-zone indexing from Prismatik calibration profile (Movies.ini / Lightpack.ini).
-  - Vectorized NumPy SIMD color averaging & hardware gamma (2.004).
-  - Non-blocking UDP DNRGB stream directly to WLED Port 21324 at 60 FPS (< 3ms latency).
+Architecture:
+  - Runs a dedicated background thread for capture + processing (no asyncio.to_thread overhead).
+  - DXcam with max_buffer_len=1 (zero queue backlog, frames always fresh).
+  - Windows High-Precision Timer (timeBeginPeriod(1)) for 1ms scheduler resolution.
+  - Prismatik calibration profile for exact zone coordinates.
+  - Vectorized NumPy color averaging + hardware gamma correction.
+  - Non-blocking UDP DNRGB packets to WLED Port 21324.
+  - Sends keepalive UDP packets when no frame is available to prevent WLED reverting to defaults.
 """
 
 import asyncio
@@ -15,6 +17,7 @@ import logging
 import os
 import re
 import socket
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -28,9 +31,11 @@ log = logging.getLogger("screen_capture")
 RGB = Tuple[int, int, int]
 
 _UDP_PORT = 21324
-_REALTIME_TIMEOUT = 2  # seconds
+# 5-second timeout: WLED holds realtime mode this long after the last packet.
+# Must be > 1/FPS gap to prevent WLED reverting to stored effect between frames.
+_REALTIME_TIMEOUT_SEC = 5
 
-# Enable Windows 1ms high-precision timer
+# Enable Windows 1ms high-precision scheduler
 try:
     ctypes.windll.winmm.timeBeginPeriod(1)
 except Exception:
@@ -43,10 +48,13 @@ except ImportError:
     _USE_DXCAM = False
 
 
+# ---------------------------------------------------------------------------
+# Prismatik profile loader
+# ---------------------------------------------------------------------------
 def _load_prismatik_profile() -> Optional[List[Tuple[int, int, int, int]]]:
     """
     Load exact LED zone rectangles from active Prismatik profile.
-    Returns list of (y1, y2, x1, x2) integer bounds.
+    Returns list of (y1, y2, x1, x2) integer bounds, length == SEG0_COUNT.
     """
     prismatik_dir = Path(os.path.expanduser("~")) / "Prismatik"
     main_conf = prismatik_dir / "main.conf"
@@ -102,35 +110,42 @@ def _load_prismatik_profile() -> Optional[List[Tuple[int, int, int, int]]]:
 
 def _compute_fallback_zones(h: int, w: int) -> List[Tuple[int, int, int, int]]:
     """Fallback geometric zones if profile not found."""
-    y_top_start, y_top_end   = int(h * 0.02), int(h * 0.12)
-    y_bot_start, y_bot_end   = int(h * 0.88), int(h * 0.98)
-    x_left_start, x_left_end = int(w * 0.02), int(w * 0.12)
+    y_top_start, y_top_end     = int(h * 0.02), int(h * 0.12)
+    y_bot_start, y_bot_end     = int(h * 0.88), int(h * 0.98)
+    x_left_start, x_left_end   = int(w * 0.02), int(w * 0.12)
     x_right_start, x_right_end = int(w * 0.88), int(w * 0.98)
-
     mid = w // 2
     zones = []
 
-    # 1. Bottom-right (0..17, 18 LEDs)
     for i in range(18):
-        zones.append((y_bot_start, y_bot_end, mid + (w - mid) * i // 18, mid + (w - mid) * (i + 1) // 18))
-    # 2. Right edge (18..35, 18 LEDs)
+        zones.append((y_bot_start, y_bot_end,
+                      mid + (w - mid) * i // 18,
+                      mid + (w - mid) * (i + 1) // 18))
     for i in range(18):
-        zones.append((h - h * (i + 1) // 18, h - h * i // 18, x_right_start, x_right_end))
-    # 3. Top edge (36..71, 36 LEDs)
+        zones.append((h - h * (i + 1) // 18, h - h * i // 18,
+                      x_right_start, x_right_end))
     for i in range(36):
-        zones.append((y_top_start, y_top_end, w - w * (i + 1) // 36, w - w * i // 36))
-    # 4. Left edge (72..89, 18 LEDs)
+        zones.append((y_top_start, y_top_end,
+                      w - w * (i + 1) // 36, w - w * i // 36))
     for i in range(18):
-        zones.append((h * i // 18, h * (i + 1) // 18, x_left_start, x_left_end))
-    # 5. Bottom-left (90..108, 19 LEDs)
+        zones.append((h * i // 18, h * (i + 1) // 18,
+                      x_left_start, x_left_end))
     for i in range(19):
-        zones.append((y_bot_start, y_bot_end, mid * i // 19, mid * (i + 1) // 19))
-
+        zones.append((y_bot_start, y_bot_end,
+                      mid * i // 19, mid * (i + 1) // 19))
     return zones
 
 
+# ---------------------------------------------------------------------------
+# Screen capture engine (runs in a dedicated thread)
+# ---------------------------------------------------------------------------
 class ScreenCaptureEngine:
-    """Ultra-low-latency screen capture engine."""
+    """
+    Dedicated-thread screen capture engine.
+
+    Runs a tight native loop in its own thread instead of asyncio.to_thread
+    to eliminate per-frame executor scheduling overhead (~10-20ms).
+    """
 
     def __init__(self) -> None:
         self._camera = None
@@ -140,19 +155,29 @@ class ScreenCaptureEngine:
         self._height = 0
         self._zones: List[Tuple[int, int, int, int]] = []
         self._sock: Optional[socket.socket] = None
-        # Pre-allocated output buffer for DNRGB packet
-        self._header = bytes([0x04, _REALTIME_TIMEOUT, 0x00, 0x00])
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
 
+        # Pre-built UDP header for DNRGB protocol:
+        # [0x04=DNRGB, timeout, start_high, start_low]
+        self._header = bytes([0x04, _REALTIME_TIMEOUT_SEC, 0x00, 0x00])
+
+        # Pre-built black keepalive packet (prevents WLED reverting to stored effect)
+        self._keepalive_pkt = self._header + bytes(config.SEG0_COUNT * 3)
+
+    # ------------------------------------------------------------------
     def start(self) -> bool:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setblocking(False)
 
         if _USE_DXCAM:
             try:
-                # max_buffer_len=1 guarantees ZERO frame queue lag
+                # max_buffer_len=1 → always get the freshest frame, zero queue lag
                 self._camera = dxcam.create(output_color="BGR", max_buffer_len=1)
-                self._camera.start(target_fps=config.SCREEN_CAPTURE_FPS, video_mode=False)
-                for _ in range(30):
+                self._camera.start(target_fps=config.SCREEN_CAPTURE_FPS,
+                                   video_mode=False)
+                # Wait for first frame to get actual resolution
+                for _ in range(60):
                     frame = self._camera.get_latest_frame()
                     if frame is not None:
                         self._height, self._width = frame.shape[:2]
@@ -160,7 +185,7 @@ class ScreenCaptureEngine:
                     time.sleep(0.016)
                 else:
                     self._height, self._width = 1080, 1920
-                log.info("DXcam started @ %d FPS (max_buffer_len=1, zero lag): %dx%d",
+                log.info("DXcam started @ %d FPS (max_buffer_len=1): %dx%d",
                          config.SCREEN_CAPTURE_FPS, self._width, self._height)
             except Exception as exc:
                 log.warning("DXcam failed (%s). Falling back to mss.", exc)
@@ -180,7 +205,7 @@ class ScreenCaptureEngine:
             self._height = mon["height"]
             self._monitor = mon
             self._init_regions()
-            log.info("mss started: %dx%d", self._width, self._height)
+            log.info("mss fallback started: %dx%d", self._width, self._height)
             return True
         except Exception as exc:
             log.error("mss failed: %s", exc)
@@ -191,10 +216,13 @@ class ScreenCaptureEngine:
         if loaded is not None and len(loaded) == config.SEG0_COUNT:
             self._zones = loaded
         else:
+            log.warning("Prismatik profile not found or wrong zone count — using fallback.")
             self._zones = _compute_fallback_zones(self._height, self._width)
-        log.info("Active capture zones: %d configured.", len(self._zones))
+        log.info("Screen capture: %d zones configured.", len(self._zones))
 
+    # ------------------------------------------------------------------
     def stop(self) -> None:
+        self._running = False
         if self._camera:
             try:
                 self._camera.stop()
@@ -211,59 +239,115 @@ class ScreenCaptureEngine:
             self._sock.close()
             self._sock = None
 
-    def capture_frame(self) -> Optional[np.ndarray]:
-        frame = None
+    # ------------------------------------------------------------------
+    def _capture_frame(self) -> Optional[np.ndarray]:
+        """Grab latest screen frame (blocking, called from capture thread)."""
         if self._camera is not None:
-            frame = self._camera.get_latest_frame()
-        elif self._sct is not None:
+            return self._camera.get_latest_frame()
+        if self._sct is not None:
             try:
                 raw = self._sct.grab(self._monitor)
-                frame = np.array(raw, dtype=np.uint8)[:, :, :3]
+                return np.array(raw, dtype=np.uint8)[:, :, :3]
             except Exception:
-                frame = None
+                return None
+        return None
 
-        if frame is not None:
-            state.latest_frame = frame
-        return frame
-
-    def compute_edge_colors(self, frame: np.ndarray) -> List[RGB]:
-        n_leds = len(self._zones)
+    def _compute_colors(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Average each zone region and apply gamma + saturation.
+        Returns uint8 array of shape (SEG0_COUNT, 3) in RGB order.
+        """
+        n = len(self._zones)
         h, w = frame.shape[:2]
-        raw_bgr = np.zeros((n_leds, 3), dtype=np.float32)
+        raw = np.empty((n, 3), dtype=np.float32)
 
         for idx, (y1, y2, x1, x2) in enumerate(self._zones):
-            r1 = max(0, min(h, y1))
-            r2 = max(r1 + 1, min(h, y2))
-            c1 = max(0, min(w, x1))
-            c2 = max(c1 + 1, min(w, x2))
-
+            r1 = max(0, min(h, y1));  r2 = max(r1 + 1, min(h, y2))
+            c1 = max(0, min(w, x1));  c2 = max(c1 + 1, min(w, x2))
             region = frame[r1:r2, c1:c2]
             if region.size > 0:
-                raw_bgr[idx] = region.mean(axis=(0, 1))
+                raw[idx] = region.mean(axis=(0, 1))
+            else:
+                raw[idx] = 0.0
 
-        # Convert BGR -> RGB
-        raw_rgb = raw_bgr[:, [2, 1, 0]]
+        # BGR → RGB
+        rgb = raw[:, [2, 1, 0]] / 255.0
 
-        # Fast SIMD Gamma (2.004) + Saturation (1.2x)
-        norm = np.clip(raw_rgb / 255.0, 0.0, 1.0)
-        max_c = norm.max(axis=1, keepdims=True)
-        sat_boost = max_c - (max_c - norm) * 1.2
-        norm = np.clip(sat_boost, 0.0, 1.0)
-        norm **= 2.004
+        # Saturation boost
+        max_c = rgb.max(axis=1, keepdims=True)
+        rgb = np.clip(max_c - (max_c - rgb) * config.SCREEN_CAPTURE_SATURATION, 0.0, 1.0)
 
-        out_rgb = (norm * 255.0).astype(np.uint8)
-        return [tuple(map(int, row)) for row in out_rgb]
+        # Gamma curve
+        rgb = np.power(rgb, config.SCREEN_CAPTURE_GAMMA)
 
-    def send_udp_packet(self, colors: List[RGB]) -> None:
+        return (rgb * 255.0).astype(np.uint8)
+
+    def _send_colors(self, colors_u8: np.ndarray) -> None:
+        """Fire DNRGB UDP packet (non-blocking, fire-and-forget)."""
         if not self._sock:
             return
-        body = bytes([ch for r, g, b in colors for ch in (r, g, b)])
+        body = colors_u8.tobytes()
         try:
             self._sock.sendto(self._header + body, (config.WLED_IP, _UDP_PORT))
         except (BlockingIOError, OSError):
             pass
 
+    def _send_keepalive(self) -> None:
+        """Send a keepalive packet to hold WLED in realtime mode."""
+        if not self._sock:
+            return
+        try:
+            self._sock.sendto(self._keepalive_pkt, (config.WLED_IP, _UDP_PORT))
+        except (BlockingIOError, OSError):
+            pass
 
+    # ------------------------------------------------------------------
+    def run_loop(self) -> None:
+        """
+        Main capture loop — runs in dedicated thread.
+        Tight native loop with no asyncio overhead.
+        """
+        interval = 1.0 / config.SCREEN_CAPTURE_FPS
+        keepalive_interval = _REALTIME_TIMEOUT_SEC / 2.0
+        last_keepalive = 0.0
+        self._running = True
+
+        log.info("Screen capture thread started @ %d FPS.", config.SCREEN_CAPTURE_FPS)
+
+        while self._running:
+            t0 = time.monotonic()
+
+            if state.seg0_source == Seg0Source.SCREEN_CAPTURE:
+                frame = self._capture_frame()
+                if frame is not None:
+                    state.latest_frame = frame
+                    colors_u8 = self._compute_colors(frame)
+                    state.update_seg0_colors(
+                        [tuple(map(int, row)) for row in colors_u8]
+                    )
+                    self._send_colors(colors_u8)
+                    last_keepalive = t0
+                else:
+                    # No frame yet — send keepalive so WLED doesn't revert
+                    if t0 - last_keepalive >= keepalive_interval:
+                        self._send_keepalive()
+                        last_keepalive = t0
+            else:
+                # Seg 0 owned by another source — send keepalive periodically
+                # so that when ownership returns the strip is still in realtime mode
+                if t0 - last_keepalive >= keepalive_interval:
+                    self._send_keepalive()
+                    last_keepalive = t0
+
+            elapsed = time.monotonic() - t0
+            sleep = interval - elapsed
+            if sleep > 0.001:
+                time.sleep(sleep)
+
+
+# ---------------------------------------------------------------------------
+# Async entry point
+# ---------------------------------------------------------------------------
 async def run() -> None:
     engine = ScreenCaptureEngine()
 
@@ -271,25 +355,13 @@ async def run() -> None:
         log.error("Screen capture failed to start.")
         return
 
-    min_interval = 1.0 / config.SCREEN_CAPTURE_FPS
-    log.info("Ultra-low latency screen capture active @ %d FPS (< 3ms latency).",
-             config.SCREEN_CAPTURE_FPS)
+    # Launch the tight capture loop in its own thread
+    thread = threading.Thread(target=engine.run_loop, name="screen_capture_loop",
+                              daemon=True)
+    thread.start()
 
-    while not state.shutdown_event.is_set():
-        loop_start = time.monotonic()
-
-        if state.seg0_source == Seg0Source.SCREEN_CAPTURE:
-            frame = await asyncio.to_thread(engine.capture_frame)
-            if frame is not None:
-                colors = await asyncio.to_thread(engine.compute_edge_colors, frame)
-                if len(colors) == config.SEG0_COUNT:
-                    state.update_seg0_colors(colors)
-                    engine.send_udp_packet(colors)
-
-        elapsed   = time.monotonic() - loop_start
-        sleep_for = max(0.0, min_interval - elapsed)
-        if sleep_for > 0:
-            await asyncio.sleep(sleep_for)
-
-    await asyncio.to_thread(engine.stop)
+    # Wait for shutdown signal, then stop
+    await state.shutdown_event.wait()
+    engine.stop()
+    thread.join(timeout=2.0)
     log.info("Screen capture stopped.")
