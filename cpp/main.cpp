@@ -52,6 +52,7 @@ struct HardwareLayout {
     // Segment 0: Screen Ambient
     int seg0_start   = 17;
     int seg0_count   = 109;
+    bool seg0_rev    = false;
     
     // Segment 1: Left Lightbar
     int seg1_start   = 0;
@@ -71,6 +72,7 @@ struct HardwareLayout {
     // Segment 3: Pomodoro / Aux
     int seg3_start   = 144;
     int seg3_count   = 6;
+    bool seg3_rev    = false;
 };
 
 // Assetto Corsa Shared Memory Structures (Official Kunos SDK layout)
@@ -565,20 +567,20 @@ int main(int argc, char* argv[]) {
     // argv[2]: target_fps
     // argv[3]: profile_req
     // argv[4]: total_leds
-    // argv[5]: seg0_start, argv[6]: seg0_count
-    // argv[7]: seg1_start, argv[8]: seg1_count, argv[9]: seg1_rev
-    // argv[10]: seg2_start, argv[11]: seg2_count, argv[12]: seg2_rev
-    // argv[13]: single_start, argv[14]: single_count, argv[15]: single_rev
-    // argv[16]: seg3_start, argv[17]: seg3_count
+    // argv[5]: seg0_start, argv[6]: seg0_count, argv[7]: seg0_rev
+    // argv[8]: seg1_start, argv[9]: seg1_count, argv[10]: seg1_rev
+    // argv[11]: seg2_start, argv[12]: seg2_count, argv[13]: seg2_rev
+    // argv[14]: single_start, argv[15]: single_count, argv[16]: single_rev
+    // argv[17]: seg3_start, argv[18]: seg3_count, argv[19]: seg3_rev
     if (argc > 1) wled_ip = argv[1];
     if (argc > 2) target_fps = (float)std::atof(argv[2]);
     if (argc > 3) profile_req = argv[3];
     if (argc > 4) hw.total_leds = std::atoi(argv[4]);
-    if (argc > 6) { hw.seg0_start = std::atoi(argv[5]); hw.seg0_count = std::atoi(argv[6]); }
-    if (argc > 9) { hw.seg1_start = std::atoi(argv[7]); hw.seg1_count = std::atoi(argv[8]); hw.seg1_rev = (std::atoi(argv[9]) != 0); }
-    if (argc > 12) { hw.seg2_start = std::atoi(argv[10]); hw.seg2_count = std::atoi(argv[11]); hw.seg2_rev = (std::atoi(argv[12]) != 0); }
-    if (argc > 15) { hw.single_start = std::atoi(argv[13]); hw.single_count = std::atoi(argv[14]); hw.single_rev = (std::atoi(argv[15]) != 0); }
-    if (argc > 17) { hw.seg3_start = std::atoi(argv[16]); hw.seg3_count = std::atoi(argv[17]); }
+    if (argc > 7) { hw.seg0_start = std::atoi(argv[5]); hw.seg0_count = std::atoi(argv[6]); hw.seg0_rev = (std::atoi(argv[7]) != 0); }
+    if (argc > 10) { hw.seg1_start = std::atoi(argv[8]); hw.seg1_count = std::atoi(argv[9]); hw.seg1_rev = (std::atoi(argv[10]) != 0); }
+    if (argc > 13) { hw.seg2_start = std::atoi(argv[11]); hw.seg2_count = std::atoi(argv[12]); hw.seg2_rev = (std::atoi(argv[13]) != 0); }
+    if (argc > 16) { hw.single_start = std::atoi(argv[14]); hw.single_count = std::atoi(argv[15]); hw.single_rev = (std::atoi(argv[16]) != 0); }
+    if (argc > 19) { hw.seg3_start = std::atoi(argv[17]); hw.seg3_count = std::atoi(argv[18]); hw.seg3_rev = (std::atoi(argv[19]) != 0); }
 
     if (target_fps <= 0.0f) target_fps = DEFAULT_FPS;
     if (hw.total_leds <= 0) hw.total_leds = 150;
@@ -587,16 +589,19 @@ int main(int argc, char* argv[]) {
     log_msg("=== RoomLights 100% Native C++ Universal Engine Started ===");
     log_msg("Target WLED: " + wled_ip + ":" + std::to_string(WLED_PORT));
     log_msg("Dynamic Total Strip Length: " + std::to_string(hw.total_leds) + " LEDs");
-    log_msg("Seg 0 (Screen Ambient): Start=" + std::to_string(hw.seg0_start) + ", Count=" + std::to_string(hw.seg0_count));
+    log_msg("Seg 0 (Screen Ambient): Start=" + std::to_string(hw.seg0_start) + ", Count=" + std::to_string(hw.seg0_count) +
+            (hw.seg0_rev ? " [REV]" : ""));
     if (hw.seg1_start >= 0 && hw.seg2_start >= 0) {
         log_msg("Dual Lightbar: Seg1 Start=" + std::to_string(hw.seg1_start) + ", Count=" + std::to_string(hw.seg1_count) +
                 (hw.seg1_rev ? " [REV]" : "") + " | Seg2 Start=" + std::to_string(hw.seg2_start) + ", Count=" + std::to_string(hw.seg2_count) +
                 (hw.seg2_rev ? " [REV]" : ""));
     } else if (hw.single_start >= 0) {
-        log_msg("Single Lightbar: Start=" + std::to_string(hw.single_start) + ", Count=" + std::to_string(hw.single_count));
+        log_msg("Single Lightbar: Start=" + std::to_string(hw.single_start) + ", Count=" + std::to_string(hw.single_count) +
+                (hw.single_rev ? " [REV]" : ""));
     }
     if (hw.seg3_start >= 0) {
-        log_msg("Seg 3 (Aux/Pomodoro): Start=" + std::to_string(hw.seg3_start) + ", Count=" + std::to_string(hw.seg3_count));
+        log_msg("Seg 3 (Aux/Pomodoro): Start=" + std::to_string(hw.seg3_start) + ", Count=" + std::to_string(hw.seg3_count) +
+                (hw.seg3_rev ? " [REV]" : ""));
     }
 
     WSADATA wsa;
@@ -760,7 +765,8 @@ int main(int argc, char* argv[]) {
         // Segment 3 (Pomodoro / Aux)
         if (ipc && hw.seg3_start >= 0) {
             for (int i = 0; i < min(hw.seg3_count, 6); i++) {
-                set_led(hw.seg3_start + i, ipc->seg3_rgb[i*3], ipc->seg3_rgb[i*3+1], ipc->seg3_rgb[i*3+2]);
+                int led_offset = hw.seg3_rev ? (min(hw.seg3_count, 6) - 1 - i) : i;
+                set_led(hw.seg3_start + led_offset, ipc->seg3_rgb[i*3], ipc->seg3_rgb[i*3+1], ipc->seg3_rgb[i*3+2]);
             }
         }
 
@@ -832,7 +838,8 @@ int main(int argc, char* argv[]) {
                         float g = sumG / (count * 255.0f);
                         float b = sumB / (count * 255.0f);
 
-                        int target_phys_idx = hw.seg0_start + i;
+                        int led_offset = hw.seg0_rev ? (hw.seg0_count - 1 - i) : i;
+                        int target_phys_idx = hw.seg0_start + led_offset;
                         int pkt_idx = 4 + target_phys_idx * 3;
                         if (target_phys_idx >= 0 && target_phys_idx < hw.total_leds) {
                             process_pixel(r, g, b, pkt[pkt_idx], pkt[pkt_idx + 1], pkt[pkt_idx + 2]);

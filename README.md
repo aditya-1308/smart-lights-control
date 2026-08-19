@@ -96,6 +96,13 @@ SEGMENT_LIGHTBAR_LEFT=1
 SEGMENT_LIGHTBAR_RIGHT=2
 SEGMENT_LIGHTBAR=-1
 SEGMENT_POMODORO=3
+
+# Optional: Invert segment LED direction (true/false)
+INVERT_SCREEN_CAPTURE=false
+INVERT_LIGHTBAR_LEFT=false
+INVERT_LIGHTBAR_RIGHT=false
+INVERT_LIGHTBAR=false
+INVERT_POMODORO=false
 ```
 
 ### 4. Calibration Profile (`profiles/`)

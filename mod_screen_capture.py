@@ -170,29 +170,31 @@ async def _run_cpp_binary(binary: Path) -> bool:
     s0 = seg_info.get(config.SEG0_ID, {})
     seg0_start = s0.get("start", config.SEG0_START_LED)
     seg0_count = s0.get("len", config.SEG0_COUNT)
+    seg0_rev = 1 if (s0.get("rev", False) ^ config.INVERT_SCREEN_CAPTURE) else 0
 
     # Resolve Seg 1 (Left Lightbar)
     s1 = seg_info.get(config.SEG1_ID, {})
     seg1_start = s1.get("start", 0) if config.SEG1_ID >= 0 else -1
     seg1_count = s1.get("len", config.SEG1_COUNT)
-    seg1_rev = 1 if s1.get("rev", False) else 0
+    seg1_rev = 1 if (s1.get("rev", False) ^ config.INVERT_LIGHTBAR_LEFT) else 0
 
     # Resolve Seg 2 (Right Lightbar)
     s2 = seg_info.get(config.SEG2_ID, {})
     seg2_start = s2.get("start", 126) if config.SEG2_ID >= 0 else -1
     seg2_count = s2.get("len", config.SEG2_COUNT)
-    seg2_rev = 1 if s2.get("rev", False) else 0
+    seg2_rev = 1 if (s2.get("rev", False) ^ config.INVERT_LIGHTBAR_RIGHT) else 0
 
     # Resolve Single Lightbar (if configured)
     s_single = seg_info.get(config.SEG_LIGHTBAR_ID, {})
     single_start = s_single.get("start", -1) if config.SEG_LIGHTBAR_ID >= 0 else -1
     single_count = s_single.get("len", 0)
-    single_rev = 1 if s_single.get("rev", False) else 0
+    single_rev = 1 if (s_single.get("rev", False) ^ config.INVERT_LIGHTBAR) else 0
 
     # Resolve Seg 3 (Pomodoro / Aux)
     s3 = seg_info.get(config.SEG3_ID, {})
     seg3_start = s3.get("start", 144) if config.SEG3_ID >= 0 else -1
     seg3_count = s3.get("len", config.SEG3_COUNT)
+    seg3_rev = 1 if (s3.get("rev", False) ^ config.INVERT_POMODORO) else 0
 
     cmd = [
         str(binary),
@@ -202,6 +204,7 @@ async def _run_cpp_binary(binary: Path) -> bool:
         str(total_leds),
         str(seg0_start),
         str(seg0_count),
+        str(seg0_rev),
         str(seg1_start),
         str(seg1_count),
         str(seg1_rev),
@@ -213,6 +216,7 @@ async def _run_cpp_binary(binary: Path) -> bool:
         str(single_rev),
         str(seg3_start),
         str(seg3_count),
+        str(seg3_rev),
     ]
     log.info("Launching Universal C++ Engine with dynamic WLED layout: %s", " ".join(cmd))
 
