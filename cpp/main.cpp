@@ -278,23 +278,25 @@ static std::vector<Zone> load_prismatik_profile(const std::string& requestedProf
         raw_zones.assign(MOVIES_PROFILE_ZONES, MOVIES_PROFILE_ZONES + 109);
     }
 
-    if (target_led_count <= 0) target_led_count = (int)raw_zones.size();
+    if (target_led_count <= 0) target_led_count = 109;
 
-    // Dynamically map/interpolate raw profile zones to target screen LED count
-    std::vector<Zone> scaled_zones(target_led_count);
-    if ((int)raw_zones.size() == target_led_count) {
-        scaled_zones = raw_zones;
+    std::vector<Zone> result_zones;
+    if ((int)raw_zones.size() >= target_led_count) {
+        log_msg("Using first " + std::to_string(target_led_count) + " calibrated zones from profile (" +
+                std::to_string(raw_zones.size()) + " raw entries).");
+        result_zones.assign(raw_zones.begin(), raw_zones.begin() + target_led_count);
     } else {
-        log_msg("Scaling " + std::to_string(raw_zones.size()) + " profile zones -> " +
+        log_msg("Interpolating " + std::to_string(raw_zones.size()) + " profile zones -> " +
                 std::to_string(target_led_count) + " target screen LEDs.");
+        result_zones.resize(target_led_count);
         for (int i = 0; i < target_led_count; i++) {
             float src_idx_f = ((float)i / (float)target_led_count) * (float)raw_zones.size();
             int src_idx = min((int)raw_zones.size() - 1, (int)src_idx_f);
-            scaled_zones[i] = raw_zones[src_idx];
+            result_zones[i] = raw_zones[src_idx];
         }
     }
 
-    return scaled_zones;
+    return result_zones;
 }
 
 // ---------------------------------------------------------------------------
