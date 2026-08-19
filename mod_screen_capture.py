@@ -148,7 +148,13 @@ async def _run_cpp_binary(binary: Path) -> bool:
     This coroutine monitors the process and restarts it if it crashes.
     Returns False if the binary fails immediately (unrecoverable).
     """
-    cmd = [str(binary), config.WLED_IP, str(config.SCREEN_CAPTURE_FPS)]
+    cmd = [
+        str(binary),
+        config.WLED_IP,
+        str(config.SCREEN_CAPTURE_FPS),
+        str(config.SEG0_START_LED),
+        config.PRISMATIK_PROFILE,
+    ]
     log.info("Launching C++ capture engine: %s", " ".join(cmd))
 
     consecutive_failures = 0

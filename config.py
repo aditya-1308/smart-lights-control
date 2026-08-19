@@ -74,6 +74,11 @@ SEG1_ID: int = _int("SEGMENT_LIGHTBAR_LEFT", 1)    # Left lightbar half (LEDs 0.
 SEG2_ID: int = _int("SEGMENT_LIGHTBAR_RIGHT", 2)   # Right lightbar half (LEDs 126..144)
 SEG3_ID: int = _int("SEGMENT_POMODORO", 3)         # Pomodoro timer (LEDs 144..150)
 
+# Physical LED Start Offset for Screen Ambient Capture Stream (default 17)
+SEG0_START_LED: int = _int("SEGMENT_0_START_LED", 17)
+# Prismatik Profile Name or Full Path (e.g. Movies.ini, Gaming.ini, Lightpack.ini)
+PRISMATIK_PROFILE: str = _get("PRISMATIK_PROFILE", "Movies.ini")
+
 SEG0_COUNT: int = 109
 SEG1_COUNT: int = 18
 SEG2_COUNT: int = 18
