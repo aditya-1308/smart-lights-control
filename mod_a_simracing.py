@@ -150,6 +150,92 @@ class ACUDPReader:
             return None
 
 
+class ACSharedMemoryReader:
+    """Reads engine RPM directly from Assetto Corsa Windows Shared Memory (acpmf_physics)."""
+
+    def __init__(self) -> None:
+        self._physics_mmap: Optional[mmap.mmap] = None
+        self._static_mmap: Optional[mmap.mmap] = None
+        self._max_rpm: float = 6500.0
+
+    def connect(self) -> bool:
+        try:
+            import mmap as mmap_mod
+            self._physics_mmap = mmap_mod.mmap(-1, 712, "acpmf_physics")
+            try:
+                self._static_mmap = mmap_mod.mmap(-1, 712, "acpmf_static")
+                static_data = self._static_mmap.read(410)
+                max_rpm = struct.unpack_from("<i", static_data, 402)[0]
+                if max_rpm > 1000:
+                    self._max_rpm = float(max_rpm)
+            except Exception:
+                pass
+            log.info("Assetto Corsa Shared Memory (acpmf_physics) connected!")
+            return True
+        except Exception:
+            return False
+
+    def disconnect(self) -> None:
+        if self._physics_mmap:
+            try:
+                self._physics_mmap.close()
+            except Exception:
+                pass
+            self._physics_mmap = None
+        if self._static_mmap:
+            try:
+                self._static_mmap.close()
+            except Exception:
+                pass
+            self._static_mmap = None
+
+    def read_rpm_pct(self) -> Optional[float]:
+        if not self._physics_mmap:
+            if not self.connect():
+                return None
+        try:
+            self._physics_mmap.seek(0)
+            data = self._physics_mmap.read(260)
+            if len(data) < 256:
+                return None
+            packet_id = struct.unpack_from("<i", data, 0)[0]
+            rpms = struct.unpack_from("<i", data, 20)[0]
+            pit_limiter = struct.unpack_from("<i", data, 248)[0]
+            if rpms <= 0 or packet_id <= 0:
+                return None
+            if pit_limiter:
+                return 1.0
+            if float(rpms) > self._max_rpm:
+                self._max_rpm = float(rpms)
+            return max(0.0, min(1.0, float(rpms) / self._max_rpm))
+        except Exception:
+            self.disconnect()
+            return None
+
+
+class ACReader:
+    """Unified Assetto Corsa Telemetry Reader (Shared Memory + UDP fallback)."""
+
+    def __init__(self, port: int = 9996) -> None:
+        self._shm = ACSharedMemoryReader()
+        self._udp = ACUDPReader(port)
+
+    def connect(self) -> bool:
+        self._shm.connect()
+        self._udp.connect()
+        return True
+
+    def disconnect(self) -> None:
+        self._shm.disconnect()
+        self._udp.disconnect()
+
+    def read_rpm_pct(self) -> Optional[float]:
+        pct = self._shm.read_rpm_pct()
+        if pct is not None:
+            return pct
+        return self._udp.read_rpm_pct()
+
+
 # ===========================================================================
 # F1 23 / F1 24 — UDP port 20777
 # ===========================================================================
@@ -315,12 +401,12 @@ class ForzaReader:
 # ===========================================================================
 
 async def run() -> None:
-    log.info("Universal sim racing telemetry starting (AC UDP + F1 + AMS2 + Forza)...")
+    log.info("Universal sim racing telemetry starting (AC SHM+UDP + F1 + AMS2 + Forza)...")
     tasks = [
-        _run_udp_reader("AC UDP", ACUDPReader(config.AC_UDP_PORT)),
-        _run_udp_reader("F1",     F1Reader()),
-        _run_udp_reader("AMS2",   AMS2Reader()),
-        _run_udp_reader("Forza",  ForzaReader()),
+        _run_udp_reader("AC Telemetry", ACReader(config.AC_UDP_PORT)),
+        _run_udp_reader("F1",           F1Reader()),
+        _run_udp_reader("AMS2",         AMS2Reader()),
+        _run_udp_reader("Forza",        ForzaReader()),
     ]
     await asyncio.gather(*tasks, return_exceptions=True)
 
