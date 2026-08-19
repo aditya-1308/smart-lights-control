@@ -1,14 +1,18 @@
 /*
  * roomlights_capture.cpp
  *
- * 100% Native C++ Ambient Screen Capture & Sim Racing Telemetry Engine.
+ * 100% Native C++ Ambient Screen Capture & Multi-Game Telemetry Engine.
  *
  * Features:
  *   1. DXGI Desktop Duplication - AcquireNextFrame(timeout=0) with non-blocking error recovery
  *   2. Direct GPU->CPU staging copy (no GenerateMips stalls)
  *   3. Prismatik 4-pixel strided accumulation (Movies.ini profile)
  *   4. Native Windows Shared Memory ("acpmf_physics" & "acpmf_static") Assetto Corsa Telemetry
- *   5. Professional Sim Racing percentage-based shift lights (65% start -> 95% full -> 96% flash)
+ *   5. Zero-latency Windows Shared Memory IPC Bridge ("RoomLights_IPC"):
+ *        - Sim Racing (F1 23/24/25, AMS2, Forza, iRacing)
+ *        - PlayStation DS4 Virtual Controller Lightbar Games (Spider-Man, God of War, Cyberpunk, etc.)
+ *        - CS2 Game State Integration (Flashes, Low-Health Pulses, Spatial Damage)
+ *        - Segment 3 (Pomodoro Timer)
  *   6. Single 454-byte UDP DNRGB packet for all 150 LEDs at rock-solid 60 FPS
  *   7. High-precision hybrid frame pacing (zero lag spikes, zero CPU starvation)
  */
@@ -51,6 +55,7 @@ static const int    TOTAL_LEDS        = 150;    // Full physical LED strip
 static const int    SEG0_COUNT        = 109;    // Screen ambient LEDs (LEDs 17..125)
 static const int    SEG1_COUNT        = 17;     // Left lightbar half (LEDs 0..16)
 static const int    SEG2_COUNT        = 18;     // Right lightbar half (LEDs 126..143)
+static const int    SEG3_COUNT        = 6;      // Pomodoro / Aux (LEDs 144..149)
 
 // Assetto Corsa Shared Memory Structures (Official Kunos SDK layout)
 #pragma pack(push, 4)
@@ -104,6 +109,28 @@ struct SPageFileStatic {
     float   suspensionMaxTravel[4];
     float   tyreRadius[4];
     float   maxTurboBoost;
+};
+#pragma pack(pop)
+
+// RoomLights Shared Memory IPC Bridge Struct
+#pragma pack(push, 1)
+struct RoomLightsIPC {
+    uint32_t magic;          // 0x524C4950 ("RLIP")
+    uint32_t version;        // 1
+    uint32_t sequence;       // Incrementing frame counter
+    uint8_t  lightbar_mode;  // 0=NONE, 1=REV_METER, 2=DS4_LIGHTBAR, 3=FULL_ARRAY
+    float    rpm_pct;
+    uint8_t  is_limiter;
+    uint8_t  ds4_r;
+    uint8_t  ds4_g;
+    uint8_t  ds4_b;
+    uint8_t  seg1_rgb[17 * 3]; // 51 bytes
+    uint8_t  seg2_rgb[18 * 3]; // 54 bytes
+    uint8_t  seg3_rgb[6 * 3];  // 18 bytes
+    uint8_t  seg0_override_active;
+    uint8_t  seg0_override_r;
+    uint8_t  seg0_override_g;
+    uint8_t  seg0_override_b;
 };
 #pragma pack(pop)
 
@@ -178,6 +205,15 @@ static std::vector<Zone> load_prismatik_profile(const std::string& requestedProf
     if (requestedProfile.find('\\') != std::string::npos || requestedProfile.find('/') != std::string::npos) {
         candidates.push_back(requestedProfile);
     } else {
+        // 1. Check project profiles/ directory first
+        candidates.push_back("profiles\\" + profileName);
+        if (profileName.find(".ini") == std::string::npos) {
+            candidates.push_back("profiles\\" + profileName + ".ini");
+        }
+        candidates.push_back("profiles\\Movies.ini");
+        candidates.push_back("profiles\\Lightpack.ini");
+
+        // 2. Check Prismatik user directory
         candidates.push_back(prismatikDir + profileName);
         if (profileName.find(".ini") == std::string::npos) {
             candidates.push_back(prismatikDir + profileName + ".ini");
@@ -328,6 +364,53 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// RoomLights Shared Memory IPC Reader (Zero Latency C++ Bridge)
+// ---------------------------------------------------------------------------
+class IPCReaderCPP {
+private:
+    HANDLE m_hMap = NULL;
+    const RoomLightsIPC* m_ipcData = nullptr;
+    bool m_connected = false;
+
+public:
+    IPCReaderCPP() {}
+    ~IPCReaderCPP() { disconnect(); }
+
+    bool connect() {
+        if (!m_hMap) {
+            m_hMap = OpenFileMappingA(FILE_MAP_READ, FALSE, "RoomLights_IPC");
+            if (m_hMap) {
+                m_ipcData = (const RoomLightsIPC*)MapViewOfFile(m_hMap, FILE_MAP_READ, 0, 0, sizeof(RoomLightsIPC));
+            }
+        }
+        if (m_ipcData && m_ipcData->magic == 0x524C4950) {
+            if (!m_connected) {
+                m_connected = true;
+                log_msg("RoomLights Shared Memory IPC Bridge connected natively in C++!");
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void disconnect() {
+        if (m_ipcData) { UnmapViewOfFile(m_ipcData); m_ipcData = nullptr; }
+        if (m_hMap) { CloseHandle(m_hMap); m_hMap = NULL; }
+        m_connected = false;
+    }
+
+    const RoomLightsIPC* get_data() {
+        if (!m_connected) {
+            connect();
+        }
+        if (m_ipcData && m_ipcData->magic == 0x524C4950) {
+            return m_ipcData;
+        }
+        return nullptr;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Sim Racing Telemetry Shift Lights Renderer (Percentage of Car Redline)
 // ---------------------------------------------------------------------------
 static void render_rev_meter(std::vector<uint8_t>& pkt, float rpm_pct, bool is_limiter, bool flash_state) {
@@ -382,7 +465,7 @@ static void render_rev_meter(std::vector<uint8_t>& pkt, float rpm_pct, bool is_l
         int seg1_idx = 4 + i * 3;
         if (i < lit_left) {
             uint8_t cr = 0, cg = 0, cb = 0;
-            if (i < 6)  { cr = 0;   cg = 255; cb = 0; }    // Green outer tip
+            if (i < 6)       { cr = 0;   cg = 255; cb = 0; }   // Green outer tip
             else if (i < 13) { cr = 255; cg = 165; cb = 0; } // Yellow middle
             else             { cr = 255; cg = 0;   cb = 0; } // Red center
 
@@ -397,7 +480,7 @@ static void render_rev_meter(std::vector<uint8_t>& pkt, float rpm_pct, bool is_l
         int seg2_idx = 4 + (126 + (17 - i)) * 3;
         if (i < lit_right) {
             uint8_t cr = 0, cg = 0, cb = 0;
-            if (i < 6)  { cr = 0;   cg = 255; cb = 0; }    // Green outer tip
+            if (i < 6)       { cr = 0;   cg = 255; cb = 0; }   // Green outer tip
             else if (i < 14) { cr = 255; cg = 165; cb = 0; } // Yellow middle
             else             { cr = 255; cg = 0;   cb = 0; } // Red center
 
@@ -428,7 +511,7 @@ int main(int argc, char* argv[]) {
     if (start_led_offset < 0) start_led_offset = 0;
 
     timeBeginPeriod(1);
-    log_msg("=== RoomLights 100% Native C++ Engine Started ===");
+    log_msg("=== RoomLights 100% Native C++ Multi-Game Engine Started ===");
     log_msg("Target WLED: " + wled_ip + ":" + std::to_string(WLED_PORT));
     log_msg("Full Physical LED Strip Payload: " + std::to_string(TOTAL_LEDS) + " LEDs starting at offset " + std::to_string(start_led_offset));
     log_msg("Target Rate: " + std::to_string((int)target_fps) + " FPS");
@@ -510,11 +593,15 @@ int main(int argc, char* argv[]) {
     ACSharedMemoryReaderCPP acTelemetry;
     acTelemetry.connect();
 
+    // Shared Memory IPC Reader (Connecting all other games, DS4, CS2, Pomodoro)
+    IPCReaderCPP ipcReader;
+    ipcReader.connect();
+
     float frameInterval_ms = 1000.0f / target_fps;
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
 
-    log_msg("100% Native C++ Capture & Telemetry Loop Active (150 LEDs, 454 byte UDP DNRGB packet @ 60 FPS).");
+    log_msg("100% Native C++ Capture & Multi-Game Telemetry Loop Active (150 LEDs, 454 byte UDP DNRGB packet @ 60 FPS).");
 
     uint64_t total_packets = 0;
     auto last_stat_log = std::chrono::steady_clock::now();
@@ -528,10 +615,12 @@ int main(int argc, char* argv[]) {
     while (true) {
         QueryPerformanceCounter(&t0);
 
-        // 1. Process Assetto Corsa Shared Memory Telemetry natively in C++
-        float rpm_pct = 0.0f;
-        bool is_limiter = false;
-        bool ac_active = acTelemetry.get_rpm_pct(rpm_pct, is_limiter);
+        // 1. Process Multi-Game & Integration Inputs (Priority Order)
+        float ac_rpm = 0.0f;
+        bool ac_limiter = false;
+        bool ac_active = acTelemetry.get_rpm_pct(ac_rpm, ac_limiter);
+
+        const RoomLightsIPC* ipc = ipcReader.get_data();
 
         auto now_steady = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now_steady - last_flash_toggle).count() >= 100) {
@@ -539,17 +628,51 @@ int main(int argc, char* argv[]) {
             last_flash_toggle = now_steady;
         }
 
-        if (ac_active && rpm_pct > 0.0f) {
-            render_rev_meter(pkt, rpm_pct, is_limiter, flash_state);
-        } else {
-            // Turn off Rev Meter (Seg 1: 0..16 & Seg 2: 126..143) when not racing
+        if (ac_active && ac_rpm > 0.0f) {
+            // Priority 1: Assetto Corsa Native Shared Memory
+            render_rev_meter(pkt, ac_rpm, ac_limiter, flash_state);
+        } else if (ipc && ipc->lightbar_mode == 1 && ipc->rpm_pct > 0.0f) {
+            // Priority 2: Universal Sim Racing Telemetry (F1 23/24/25, AMS2, Forza, iRacing) via IPC
+            render_rev_meter(pkt, ipc->rpm_pct, ipc->is_limiter != 0, flash_state);
+        } else if (ipc && ipc->lightbar_mode == 2 && (ipc->ds4_r + ipc->ds4_g + ipc->ds4_b) > 0) {
+            // Priority 3: PlayStation DS4 Controller Lightbar Game Color
             for (int i = 0; i < SEG1_COUNT; i++) {
-                int seg1_idx = 4 + i * 3;
-                pkt[seg1_idx] = pkt[seg1_idx+1] = pkt[seg1_idx+2] = 0;
+                int idx = 4 + i * 3;
+                pkt[idx] = ipc->ds4_r; pkt[idx+1] = ipc->ds4_g; pkt[idx+2] = ipc->ds4_b;
             }
             for (int i = 0; i < SEG2_COUNT; i++) {
-                int seg2_idx = 4 + (126 + (17 - i)) * 3;
-                pkt[seg2_idx] = pkt[seg2_idx+1] = pkt[seg2_idx+2] = 0;
+                int idx = 4 + (126 + (17 - i)) * 3;
+                pkt[idx] = ipc->ds4_r; pkt[idx+1] = ipc->ds4_g; pkt[idx+2] = ipc->ds4_b;
+            }
+        } else if (ipc && ipc->lightbar_mode == 3) {
+            // Priority 4: Custom Lightbar Array (CS2 Flashes, Health Pulses, Bomb timer)
+            for (int i = 0; i < SEG1_COUNT; i++) {
+                int idx = 4 + i * 3;
+                pkt[idx] = ipc->seg1_rgb[i*3]; pkt[idx+1] = ipc->seg1_rgb[i*3+1]; pkt[idx+2] = ipc->seg1_rgb[i*3+2];
+            }
+            for (int i = 0; i < SEG2_COUNT; i++) {
+                int idx = 4 + (126 + (17 - i)) * 3;
+                pkt[idx] = ipc->seg2_rgb[i*3]; pkt[idx+1] = ipc->seg2_rgb[i*3+1]; pkt[idx+2] = ipc->seg2_rgb[i*3+2];
+            }
+        } else {
+            // Idle / Off on Seg 1 & 2
+            for (int i = 0; i < SEG1_COUNT; i++) {
+                int idx = 4 + i * 3;
+                pkt[idx] = pkt[idx+1] = pkt[idx+2] = 0;
+            }
+            for (int i = 0; i < SEG2_COUNT; i++) {
+                int idx = 4 + (126 + (17 - i)) * 3;
+                pkt[idx] = pkt[idx+1] = pkt[idx+2] = 0;
+            }
+        }
+
+        // Segment 3 (Pomodoro / Aux - LEDs 144..149)
+        if (ipc) {
+            for (int i = 0; i < SEG3_COUNT; i++) {
+                int idx = 4 + (144 + i) * 3;
+                pkt[idx]   = ipc->seg3_rgb[i*3];
+                pkt[idx+1] = ipc->seg3_rgb[i*3+1];
+                pkt[idx+2] = ipc->seg3_rgb[i*3+2];
             }
         }
 
@@ -643,10 +766,16 @@ int main(int argc, char* argv[]) {
                 // Log stats every 5s
                 if (std::chrono::duration_cast<std::chrono::seconds>(now_steady - last_stat_log).count() >= 5) {
                     last_stat_log = now_steady;
+                    std::string active_source = "IDLE";
+                    float cur_rpm = 0.0f;
+                    if (ac_active && ac_rpm > 0.0f) { active_source = "AC_NATIVE"; cur_rpm = ac_rpm; }
+                    else if (ipc && ipc->lightbar_mode == 1 && ipc->rpm_pct > 0.0f) { active_source = "SIMRACING_IPC"; cur_rpm = ipc->rpm_pct; }
+                    else if (ipc && ipc->lightbar_mode == 2) { active_source = "DS4_LIGHTBAR"; }
+                    else if (ipc && ipc->lightbar_mode == 3) { active_source = "CUSTOM_ARRAY"; }
+
                     log_msg("Native C++ UDP Stats: Sent " + std::to_string(total_packets) +
-                            " packets. AC Active=" + (ac_active ? "YES" : "NO") +
-                            ", MaxRPM=" + std::to_string(acTelemetry.get_max_rpm()) +
-                            ", RPM=" + std::to_string(rpm_pct * 100.0f) + "%");
+                            " packets. ActiveSource=" + active_source +
+                            ", RPM=" + std::to_string(cur_rpm * 100.0f) + "%");
                 }
             }
         }

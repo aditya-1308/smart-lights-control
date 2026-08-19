@@ -155,7 +155,7 @@ async def _run_cpp_binary(binary: Path) -> bool:
         "0",  # Full physical strip starting at LED 0
         config.PRISMATIK_PROFILE,
     ]
-    log.info("Launching 100% C++ capture & telemetry engine: %s", " ".join(cmd))
+    log.info("Launching 100%% C++ capture & telemetry engine: %s", " ".join(cmd))
 
     consecutive_failures = 0
     while not state.shutdown_event.is_set():

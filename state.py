@@ -66,7 +66,7 @@ class SharedState:
         self._lightbar_last_update: float = 0.0  # time.monotonic()
 
         # -- Rev meter --
-        self.rpm_pct: float = 0.0  # 0.0 – 1.0
+        self._rpm_pct: float = 0.0  # 0.0 – 1.0
 
         # -- Context --
         self.context: AppContext = AppContext.IDLE
@@ -108,6 +108,19 @@ class SharedState:
         # -- Shared screen frame (written by mod_screen_capture, read by mod_smart_roi) --
         self.latest_frame: Optional[object] = None  # numpy ndarray or None
 
+    @property
+    def rpm_pct(self) -> float:
+        return self._rpm_pct
+
+    @rpm_pct.setter
+    def rpm_pct(self, val: float) -> None:
+        self._rpm_pct = max(0.0, min(1.0, float(val)))
+        try:
+            from ipc_bridge import ipc_bridge
+            ipc_bridge.update_telemetry(self._rpm_pct)
+        except Exception:
+            pass
+
     def set_discovered_segments(self, seg_dict: dict) -> None:
         """Store discovered segment metadata from WLED."""
         with self._thread_lock:
@@ -122,6 +135,11 @@ class SharedState:
         with self._thread_lock:
             self._lightbar_rgb = (r, g, b)
             self._lightbar_last_update = time.monotonic()
+            try:
+                from ipc_bridge import ipc_bridge
+                ipc_bridge.update_ds4_color(r, g, b)
+            except Exception:
+                pass
 
     def get_lightbar_rgb(self) -> Tuple[int, int, int]:
         """Read the most recent DS4 lightbar color (lock-free read)."""

@@ -125,15 +125,19 @@ DS4_NOTIFICATION_CB = CFUNCTYPE(
 
 
 def _find_vigem_dll() -> Optional[Path]:
+    import os
     candidates = []
     if VGAMEPAD_AVAILABLE:
         pkg_dir = Path(vg.__file__).parent
         candidates.extend(pkg_dir.rglob("ViGEmClient.dll"))
 
+    prog_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    sys_root   = os.environ.get("SystemRoot", r"C:\Windows")
+
     candidates += [
-        Path(r"C:\Program Files\ViGEm\ViGEmClient.dll"),
-        Path(r"C:\Windows\System32\ViGEmClient.dll"),
-        Path(r"C:\Windows\SysWOW64\ViGEmClient.dll"),
+        Path(prog_files) / "ViGEm" / "ViGEmClient.dll",
+        Path(sys_root) / "System32" / "ViGEmClient.dll",
+        Path(sys_root) / "SysWOW64" / "ViGEmClient.dll",
     ]
 
     for path in candidates:

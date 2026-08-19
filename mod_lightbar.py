@@ -142,10 +142,18 @@ class LightbarRenderer:
         else:  # IDLE
             color_array = [_OFF] * config.LIGHTBAR_TOTAL
 
-        # Send to WLED only if state changed (saves HTTP traffic)
+        # Send to C++ IPC bridge and WLED
         if color_array != self._last_sent_colors:
             self._last_sent_colors = list(color_array)
             state.update_lightbar_colors(color_array)
+            try:
+                from ipc_bridge import ipc_bridge
+                if mode in (LightbarMode.CS2_FLASH, LightbarMode.CS2_PULSE):
+                    ipc_bridge.update_raw_lightbar(color_array[:17], color_array[17:])
+                elif mode == LightbarMode.IDLE and not state.is_ds4_active() and state.rpm_pct <= 0:
+                    ipc_bridge.clear()
+            except Exception:
+                pass
             await self._wled.set_lightbar(color_array)
 
         await self._update_mode()
