@@ -99,31 +99,47 @@ class ACUDPReader:
             return None
 
         now = time.monotonic()
-        # Resend handshake every 0.5s when AC hasn't replied yet,
-        # or every 2s during active session (AC re-starts the stream on reconnect)
         no_data_recently = (now - self._last_received) > 1.0
         handshake_interval = 0.5 if no_data_recently else 2.0
         if now - self._last_handshake > handshake_interval:
             self._send_handshake()
 
-        try:
-            data, _ = self._sock.recvfrom(2048)
-        except (BlockingIOError, OSError):
+        # Drain socket buffer to get the freshest packet
+        latest_data = None
+        while True:
+            try:
+                data, _ = self._sock.recvfrom(2048)
+                if data:
+                    latest_data = data
+            except (BlockingIOError, OSError):
+                break
+
+        if not latest_data:
             return None
 
-        if len(data) < 84:
+        # 408 bytes = AC Handshake Response packet
+        if len(latest_data) == 408:
+            self._last_received = now
+            log.info("Assetto Corsa UDP Handshake acknowledged by game.")
             return None
 
-        # Unpack telemetry fields
+        if len(latest_data) < 84:
+            return None
+
+        # Unpack RTCarTelemetry packet fields
         try:
-            is_limiter = data[29] if len(data) > 29 else 0
-            engine_rpm = struct.unpack_from("<f", data, 72)[0]
+            is_limiter = latest_data[29] if len(latest_data) > 29 else 0
+            engine_rpm = struct.unpack_from("<f", latest_data, 72)[0]
+            max_rpm = struct.unpack_from("<f", latest_data, 84)[0] if len(latest_data) >= 88 else 0.0
+
             if engine_rpm <= 0:
                 return None
 
-            self._last_received = now  # mark that AC is actively sending
+            self._last_received = now  # mark active telemetry
 
-            if engine_rpm > self._max_rpm_seen:
+            if max_rpm > 1000.0:
+                self._max_rpm_seen = max_rpm
+            elif engine_rpm > self._max_rpm_seen:
                 self._max_rpm_seen = engine_rpm
 
             if is_limiter:

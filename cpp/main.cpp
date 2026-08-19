@@ -184,11 +184,12 @@ int main(int argc, char* argv[]) {
     inet_pton(AF_INET, wled_ip.c_str(), &dest.sin_addr);
 
     // DNRGB packet: [0x04=DNRGB, timeout_sec, start_hi, start_lo, R0,G0,B0, ...]
+    // Physical Segment 0 starts at LED 17 (0x0011)
     std::vector<uint8_t> pkt(4 + NUM_LEDS * 3, 0);
     pkt[0] = 0x04;
     pkt[1] = (uint8_t)KEEPALIVE_SEC;
     pkt[2] = 0x00;
-    pkt[3] = 0x00;
+    pkt[3] = 17; // LED 17 start offset
 
     // -----------------------------------------------------------------------
     // D3D11 Device

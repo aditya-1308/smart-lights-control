@@ -214,7 +214,7 @@ class PythonCaptureEngine:
         self._zones: List[Tuple[int, int, int, int]] = []
         self._sock: Optional[socket.socket] = None
         self._running = False
-        self._header = bytes([0x04, _REALTIME_TIMEOUT, 0x00, 0x00])
+        self._header = bytes([0x04, _REALTIME_TIMEOUT, (17 >> 8) & 0xFF, 17 & 0xFF])
         self._keepalive_pkt = self._header + bytes(config.SEG0_COUNT * 3)
 
     def start(self) -> bool:
