@@ -4,16 +4,13 @@
  * 100% Native C++ Ambient Screen Capture & Sim Racing Telemetry Engine.
  *
  * Features:
- *   1. DXGI Desktop Duplication - AcquireNextFrame(timeout=0)
+ *   1. DXGI Desktop Duplication - AcquireNextFrame(timeout=0) with non-blocking error recovery
  *   2. Direct GPU->CPU staging copy (no GenerateMips stalls)
  *   3. Prismatik 4-pixel strided accumulation (Movies.ini profile)
  *   4. Native Windows Shared Memory ("acpmf_physics" & "acpmf_static") Assetto Corsa Telemetry
- *   5. Full 150-LED strip unification in ONE 454-byte UDP DNRGB packet:
- *        - LEDs   0.. 17 (18 LEDs) : Segment 1 (Left Lightbar - Rev Meter)
- *        - LEDs  17..125 (109 LEDs): Segment 0 (Screen Ambient Capture)
- *        - LEDs 126..143 (18 LEDs) : Segment 2 (Right Lightbar - Rev Meter)
- *        - LEDs 144..149 ( 6 LEDs) : Segment 3 (Pomodoro / Status)
- *   6. Real-time logging to roomlights_capture.log
+ *   5. Professional Sim Racing percentage-based shift lights (65% start -> 95% full -> 96% flash)
+ *   6. Single 454-byte UDP DNRGB packet for all 150 LEDs at rock-solid 60 FPS
+ *   7. High-precision hybrid frame pacing (zero lag spikes, zero CPU starvation)
  */
 
 #pragma comment(lib, "d3d11.lib")
@@ -51,11 +48,11 @@ static const float  DEFAULT_FPS       = 60.0f;
 static const int    PIXELS_PER_STEP   = 4;      // Prismatik 4-pixel strided sampling
 
 static const int    TOTAL_LEDS        = 150;    // Full physical LED strip
-static const int    SEG0_COUNT        = 109;    // Screen ambient LEDs
-static const int    SEG1_COUNT        = 18;     // Left lightbar half
-static const int    SEG2_COUNT        = 18;     // Right lightbar half
+static const int    SEG0_COUNT        = 109;    // Screen ambient LEDs (LEDs 17..125)
+static const int    SEG1_COUNT        = 17;     // Left lightbar half (LEDs 0..16)
+static const int    SEG2_COUNT        = 18;     // Right lightbar half (LEDs 126..143)
 
-// Assetto Corsa Shared Memory Structures (from GitHub sim_info.py / SPageFilePhysics)
+// Assetto Corsa Shared Memory Structures (Official Kunos SDK layout)
 #pragma pack(push, 4)
 struct SPageFilePhysics {
     int   packetId;
@@ -100,7 +97,13 @@ struct SPageFileStatic {
     wchar_t playerSurname[33];
     wchar_t playerNick[33];
     int     sectorCount;
+    float   maxTorque;
+    float   maxPower;
     int     maxRpm;
+    float   maxFuel;
+    float   suspensionMaxTravel[4];
+    float   tyreRadius[4];
+    float   maxTurboBoost;
 };
 #pragma pack(pop)
 
@@ -250,7 +253,7 @@ private:
     HANDLE m_hStaticMap  = NULL;
     const SPageFilePhysics* m_physicsData = nullptr;
     const SPageFileStatic*  m_staticData  = nullptr;
-    int m_maxRpm = 6500;
+    int m_maxRpm = 0;
     bool m_connected = false;
 
 public:
@@ -258,24 +261,29 @@ public:
     ~ACSharedMemoryReaderCPP() { disconnect(); }
 
     bool connect() {
-        if (m_connected) return true;
-
-        m_hPhysicsMap = OpenFileMappingA(FILE_MAP_READ, FALSE, "acpmf_physics");
-        if (m_hPhysicsMap) {
-            m_physicsData = (const SPageFilePhysics*)MapViewOfFile(m_hPhysicsMap, FILE_MAP_READ, 0, 0, sizeof(SPageFilePhysics));
-        }
-
-        m_hStaticMap = OpenFileMappingA(FILE_MAP_READ, FALSE, "acpmf_static");
-        if (m_hStaticMap) {
-            m_staticData = (const SPageFileStatic*)MapViewOfFile(m_hStaticMap, FILE_MAP_READ, 0, 0, sizeof(SPageFileStatic));
-            if (m_staticData && m_staticData->maxRpm > 1000) {
-                m_maxRpm = m_staticData->maxRpm;
+        if (!m_hPhysicsMap) {
+            m_hPhysicsMap = OpenFileMappingA(FILE_MAP_READ, FALSE, "acpmf_physics");
+            if (m_hPhysicsMap) {
+                m_physicsData = (const SPageFilePhysics*)MapViewOfFile(m_hPhysicsMap, FILE_MAP_READ, 0, 0, sizeof(SPageFilePhysics));
             }
         }
 
+        if (!m_hStaticMap) {
+            m_hStaticMap = OpenFileMappingA(FILE_MAP_READ, FALSE, "acpmf_static");
+            if (m_hStaticMap) {
+                m_staticData = (const SPageFileStatic*)MapViewOfFile(m_hStaticMap, FILE_MAP_READ, 0, 0, sizeof(SPageFileStatic));
+            }
+        }
+
+        if (m_staticData && m_staticData->maxRpm > 1000) {
+            m_maxRpm = m_staticData->maxRpm;
+        }
+
         if (m_physicsData) {
-            m_connected = true;
-            log_msg("Assetto Corsa Shared Memory connected natively in C++!");
+            if (!m_connected) {
+                m_connected = true;
+                log_msg("Assetto Corsa Shared Memory connected natively in C++!");
+            }
             return true;
         }
         return false;
@@ -290,55 +298,93 @@ public:
     }
 
     bool get_rpm_pct(float& out_pct, bool& out_limiter) {
-        if (!m_connected) {
-            if (!connect()) return false;
+        if (!connect() || !m_physicsData) {
+            return false;
         }
 
-        if (!m_physicsData || m_physicsData->packetId <= 0 || m_physicsData->rpms <= 0) {
+        if (m_physicsData->packetId <= 0 || m_physicsData->rpms <= 0) {
             return false;
+        }
+
+        if (m_staticData && m_staticData->maxRpm > 1000) {
+            m_maxRpm = m_staticData->maxRpm;
         }
 
         int rpms = m_physicsData->rpms;
         out_limiter = (m_physicsData->pitLimiterOn != 0);
 
-        if (rpms > m_maxRpm) m_maxRpm = rpms;
-        out_pct = (float)rpms / (float)m_maxRpm;
+        if (m_maxRpm <= 0 || rpms > m_maxRpm) {
+            m_maxRpm = rpms;
+        }
+
+        out_pct = (m_maxRpm > 0) ? ((float)rpms / (float)m_maxRpm) : 0.0f;
         if (out_pct < 0.0f) out_pct = 0.0f;
         if (out_pct > 1.0f) out_pct = 1.0f;
 
         return true;
     }
+
+    int get_max_rpm() const { return m_maxRpm; }
 };
 
 // ---------------------------------------------------------------------------
-// Render 35-LED Outer-to-Inner Telemetry Rev Meter into UDP Packet Buffer
+// Sim Racing Telemetry Shift Lights Renderer (Percentage of Car Redline)
 // ---------------------------------------------------------------------------
 static void render_rev_meter(std::vector<uint8_t>& pkt, float rpm_pct, bool is_limiter, bool flash_state) {
-    // Seg 1 (LEDs 0..16, 17 LEDs) and Seg 2 (LEDs 126..143, 18 LEDs)
-    const float REV_START_PCT = 0.28f;
-    const float REV_FULL_PCT  = 0.82f;
+    // Professional SimHub-standard RPM scaling:
+    //   - 0.00 .. 0.65 : OFF (Ambient driving)
+    //   - 0.65 .. 0.75 : Green (Outer tips)
+    //   - 0.75 .. 0.88 : Yellow (Middle)
+    //   - 0.88 .. 0.95 : Red (Center)
+    //   - >= 0.96      : Flashing Shift Light / Limiter
+    const float REV_START_PCT = 0.65f;
+    const float REV_FULL_PCT  = 0.95f;
+    const float REV_LIMIT_PCT = 0.96f;
 
-    uint8_t r = 0, g = 0, b = 0;
-    if (is_limiter || rpm_pct >= 0.93f) {
-        if (flash_state) {
-            r = 0; g = 100; b = 255; // Flashing Blue on limiter
+    uint8_t flash_r = 0, flash_g = 100, flash_b = 255; // Flashing Blue on limiter/shift
+
+    if (is_limiter || rpm_pct >= REV_LIMIT_PCT) {
+        uint8_t cr = flash_state ? flash_r : 0;
+        uint8_t cg = flash_state ? flash_g : 0;
+        uint8_t cb = flash_state ? flash_b : 0;
+
+        for (int i = 0; i < SEG1_COUNT; i++) {
+            int seg1_idx = 4 + i * 3;
+            pkt[seg1_idx] = cr; pkt[seg1_idx + 1] = cg; pkt[seg1_idx + 2] = cb;
         }
+        for (int i = 0; i < SEG2_COUNT; i++) {
+            int seg2_idx = 4 + (126 + (17 - i)) * 3;
+            pkt[seg2_idx] = cr; pkt[seg2_idx + 1] = cg; pkt[seg2_idx + 2] = cb;
+        }
+        return;
+    }
+
+    if (rpm_pct < REV_START_PCT) {
+        // Below start threshold: turn off rev lights
+        for (int i = 0; i < SEG1_COUNT; i++) {
+            int seg1_idx = 4 + i * 3;
+            pkt[seg1_idx] = pkt[seg1_idx + 1] = pkt[seg1_idx + 2] = 0;
+        }
+        for (int i = 0; i < SEG2_COUNT; i++) {
+            int seg2_idx = 4 + (126 + (17 - i)) * 3;
+            pkt[seg2_idx] = pkt[seg2_idx + 1] = pkt[seg2_idx + 2] = 0;
+        }
+        return;
     }
 
     float span = REV_FULL_PCT - REV_START_PCT;
     float norm = (span > 0.0f) ? max(0.0f, min(1.0f, (rpm_pct - REV_START_PCT) / span)) : 0.0f;
-    int lit_left  = (int)std::round(norm * 17.0f);
-    int lit_right = (int)std::round(norm * 18.0f);
+    int lit_left  = (int)std::round(norm * (float)SEG1_COUNT);
+    int lit_right = (int)std::round(norm * (float)SEG2_COUNT);
 
-    // Left side (Seg 1: LEDs 0..16)
-    for (int i = 0; i < 17; i++) {
+    // Left side (Seg 1: LEDs 0..16, 17 LEDs total)
+    for (int i = 0; i < SEG1_COUNT; i++) {
         int seg1_idx = 4 + i * 3;
         if (i < lit_left) {
             uint8_t cr = 0, cg = 0, cb = 0;
-            if (is_limiter || rpm_pct >= 0.93f) { cr = r; cg = g; cb = b; }
-            else if (i < 6)  { cr = 0; cg = 255; cb = 0; }
-            else if (i < 15) { cr = 255; cg = 165; cb = 0; }
-            else             { cr = 255; cg = 0; cb = 0; }
+            if (i < 6)  { cr = 0;   cg = 255; cb = 0; }    // Green outer tip
+            else if (i < 13) { cr = 255; cg = 165; cb = 0; } // Yellow middle
+            else             { cr = 255; cg = 0;   cb = 0; } // Red center
 
             pkt[seg1_idx] = cr; pkt[seg1_idx + 1] = cg; pkt[seg1_idx + 2] = cb;
         } else {
@@ -346,15 +392,14 @@ static void render_rev_meter(std::vector<uint8_t>& pkt, float rpm_pct, bool is_l
         }
     }
 
-    // Right side (Seg 2: LEDs 126..143)
-    for (int i = 0; i < 18; i++) {
+    // Right side (Seg 2: LEDs 126..143, 18 LEDs total)
+    for (int i = 0; i < SEG2_COUNT; i++) {
         int seg2_idx = 4 + (126 + (17 - i)) * 3;
         if (i < lit_right) {
             uint8_t cr = 0, cg = 0, cb = 0;
-            if (is_limiter || rpm_pct >= 0.93f) { cr = r; cg = g; cb = b; }
-            else if (i < 7)  { cr = 0; cg = 255; cb = 0; }
-            else if (i < 16) { cr = 255; cg = 165; cb = 0; }
-            else             { cr = 255; cg = 0; cb = 0; }
+            if (i < 6)  { cr = 0;   cg = 255; cb = 0; }    // Green outer tip
+            else if (i < 14) { cr = 255; cg = 165; cb = 0; } // Yellow middle
+            else             { cr = 255; cg = 0;   cb = 0; } // Red center
 
             pkt[seg2_idx] = cr; pkt[seg2_idx + 1] = cg; pkt[seg2_idx + 2] = cb;
         } else {
@@ -431,7 +476,7 @@ int main(int argc, char* argv[]) {
     adapter->EnumOutputs(0, &output);
     output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
 
-    // DXGI Desktop Duplication retry loop (handles 0x80070005 Access Denied gracefully)
+    // Initial DXGI Desktop Duplication attach
     int retry_count = 0;
     while (FAILED(hr = output1->DuplicateOutput(d3dDev, &dupl))) {
         retry_count++;
@@ -469,13 +514,16 @@ int main(int argc, char* argv[]) {
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
 
-    log_msg("100% Native C++ Capture & Telemetry Loop Active (" + std::to_string(TOTAL_LEDS) +
-            " LEDs, " + std::to_string(pkt.size()) + " byte UDP DNRGB packet @ 60 FPS).");
+    log_msg("100% Native C++ Capture & Telemetry Loop Active (150 LEDs, 454 byte UDP DNRGB packet @ 60 FPS).");
 
     uint64_t total_packets = 0;
     auto last_stat_log = std::chrono::steady_clock::now();
     bool flash_state = false;
     auto last_flash_toggle = std::chrono::steady_clock::now();
+    auto last_dupl_retry = std::chrono::steady_clock::now();
+
+    DXGI_OUTDUPL_FRAME_INFO frameInfo{};
+    IDXGIResource* res = nullptr;
 
     while (true) {
         QueryPerformanceCounter(&t0);
@@ -486,7 +534,7 @@ int main(int argc, char* argv[]) {
         bool ac_active = acTelemetry.get_rpm_pct(rpm_pct, is_limiter);
 
         auto now_steady = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now_steady - last_flash_toggle).count() >= 125) {
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now_steady - last_flash_toggle).count() >= 100) {
             flash_state = !flash_state;
             last_flash_toggle = now_steady;
         }
@@ -495,33 +543,44 @@ int main(int argc, char* argv[]) {
             render_rev_meter(pkt, rpm_pct, is_limiter, flash_state);
         } else {
             // Turn off Rev Meter (Seg 1: 0..16 & Seg 2: 126..143) when not racing
-            for (int i = 0; i < 17; i++) {
+            for (int i = 0; i < SEG1_COUNT; i++) {
                 int seg1_idx = 4 + i * 3;
                 pkt[seg1_idx] = pkt[seg1_idx+1] = pkt[seg1_idx+2] = 0;
             }
-            for (int i = 0; i < 18; i++) {
+            for (int i = 0; i < SEG2_COUNT; i++) {
                 int seg2_idx = 4 + (126 + (17 - i)) * 3;
                 pkt[seg2_idx] = pkt[seg2_idx+1] = pkt[seg2_idx+2] = 0;
             }
         }
 
         // 2. Process DXGI Desktop Duplication Screen Capture for Segment 0 (LEDs 17..125)
-        DXGI_OUTDUPL_FRAME_INFO frameInfo{};
-        IDXGIResource* res = nullptr;
+        if (!dupl) {
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now_steady - last_dupl_retry).count() >= 500) {
+                last_dupl_retry = now_steady;
+                output1->DuplicateOutput(d3dDev, &dupl);
+            }
+            // Still transmit full packet with rev meter / ambient keepalive
+            sendto(sock, (const char*)pkt.data(), (int)pkt.size(), 0, (sockaddr*)&dest, sizeof(dest));
+            total_packets++;
+            goto frame_done;
+        }
 
+        res = nullptr;
+        memset(&frameInfo, 0, sizeof(frameInfo));
         hr = dupl->AcquireNextFrame(0, &frameInfo, &res);
 
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            // Re-send full strip packet to maintain smooth 60 FPS stream
+            // Screen didn't change: re-send packet immediately with 0 delay
             sendto(sock, (const char*)pkt.data(), (int)pkt.size(), 0, (sockaddr*)&dest, sizeof(dest));
-            Sleep(1);
+            total_packets++;
             goto frame_done;
         }
 
         if (FAILED(hr)) {
+            // Access lost / mode change: non-blocking cleanup
             if (dupl) { dupl->Release(); dupl = nullptr; }
-            Sleep(200);
-            hr = output1->DuplicateOutput(d3dDev, &dupl);
+            sendto(sock, (const char*)pkt.data(), (int)pkt.size(), 0, (sockaddr*)&dest, sizeof(dest));
+            total_packets++;
             goto frame_done;
         }
 
@@ -586,16 +645,25 @@ int main(int argc, char* argv[]) {
                     last_stat_log = now_steady;
                     log_msg("Native C++ UDP Stats: Sent " + std::to_string(total_packets) +
                             " packets. AC Active=" + (ac_active ? "YES" : "NO") +
+                            ", MaxRPM=" + std::to_string(acTelemetry.get_max_rpm()) +
                             ", RPM=" + std::to_string(rpm_pct * 100.0f) + "%");
                 }
             }
         }
 
 frame_done:
+        // High-precision hybrid frame pacing (sleep for majority, spin for final 1ms)
         QueryPerformanceCounter(&t1);
         double elapsed_ms = (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
         double wait_ms    = frameInterval_ms - elapsed_ms;
-        if (wait_ms > 1.5) Sleep((DWORD)(wait_ms - 1.0));
+        if (wait_ms > 2.0) {
+            Sleep((DWORD)(wait_ms - 1.5));
+        }
+        while (true) {
+            QueryPerformanceCounter(&t1);
+            if ((t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart >= frameInterval_ms) break;
+            YieldProcessor();
+        }
     }
 
     timeEndPeriod(1);
