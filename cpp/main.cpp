@@ -2,19 +2,13 @@
  * roomlights_capture.cpp
  *
  * 100% Native C++ Ambient Screen Capture & Multi-Game Telemetry Engine.
- *
- * Features:
- *   1. DXGI Desktop Duplication - AcquireNextFrame(timeout=0) with non-blocking error recovery
- *   2. Direct GPU->CPU staging copy (no GenerateMips stalls)
- *   3. Prismatik 4-pixel strided accumulation (Movies.ini profile)
- *   4. Native Windows Shared Memory ("acpmf_physics" & "acpmf_static") Assetto Corsa Telemetry
- *   5. Zero-latency Windows Shared Memory IPC Bridge ("RoomLights_IPC"):
- *        - Sim Racing (F1 23/24/25, AMS2, Forza, iRacing)
- *        - PlayStation DS4 Virtual Controller Lightbar Games (Spider-Man, God of War, Cyberpunk, etc.)
- *        - CS2 Game State Integration (Flashes, Low-Health Pulses, Spatial Damage)
- *        - Segment 3 (Pomodoro Timer)
- *   6. Single 454-byte UDP DNRGB packet for all 150 LEDs at rock-solid 60 FPS
- *   7. High-precision hybrid frame pacing (zero lag spikes, zero CPU starvation)
+ * Universal Dynamic Hardware Architecture:
+ *   - Completely dynamic LED count and segment boundaries (passed at startup from WLED)
+ *   - Works out of the box with any strip length and any segment configuration
+ *   - Dynamic profile zone scaling (adapts any Prismatik profile to any screen segment size)
+ *   - Dynamic Dual-Bar / Single-Bar sim racing rev meter and DS4 lightbar rendering
+ *   - Zero-latency Windows Shared Memory IPC Bridge ("RoomLights_IPC")
+ *   - High-precision hybrid 60 FPS frame pacer (zero lag spikes)
  */
 
 #pragma comment(lib, "d3d11.lib")
@@ -51,11 +45,33 @@ static const int    KEEPALIVE_SEC     = 5;      // WLED realtime timeout
 static const float  DEFAULT_FPS       = 60.0f;
 static const int    PIXELS_PER_STEP   = 4;      // Prismatik 4-pixel strided sampling
 
-static const int    TOTAL_LEDS        = 150;    // Full physical LED strip
-static const int    SEG0_COUNT        = 109;    // Screen ambient LEDs (LEDs 17..125)
-static const int    SEG1_COUNT        = 17;     // Left lightbar half (LEDs 0..16)
-static const int    SEG2_COUNT        = 18;     // Right lightbar half (LEDs 126..143)
-static const int    SEG3_COUNT        = 6;      // Pomodoro / Aux (LEDs 144..149)
+// Dynamic Hardware Layout Struct
+struct HardwareLayout {
+    int total_leds   = 150;
+    
+    // Segment 0: Screen Ambient
+    int seg0_start   = 17;
+    int seg0_count   = 109;
+    
+    // Segment 1: Left Lightbar
+    int seg1_start   = 0;
+    int seg1_count   = 17;
+    bool seg1_rev    = false;
+    
+    // Segment 2: Right Lightbar
+    int seg2_start   = 126;
+    int seg2_count   = 18;
+    bool seg2_rev    = false;
+    
+    // Single Lightbar Alternative (if seg1 and seg2 are disabled)
+    int single_start = -1;
+    int single_count = 0;
+    bool single_rev  = false;
+    
+    // Segment 3: Pomodoro / Aux
+    int seg3_start   = 144;
+    int seg3_count   = 6;
+};
 
 // Assetto Corsa Shared Memory Structures (Official Kunos SDK layout)
 #pragma pack(push, 4)
@@ -191,10 +207,10 @@ static const Zone MOVIES_PROFILE_ZONES[109] = {
 };
 
 // ---------------------------------------------------------------------------
-// Prismatik Profile Loader
+// Dynamic Prismatik Profile Loader (Scales to any screen segment size)
 // ---------------------------------------------------------------------------
-static std::vector<Zone> load_prismatik_profile(const std::string& requestedProfile, int max_allowed_leds) {
-    std::vector<Zone> zones;
+static std::vector<Zone> load_prismatik_profile(const std::string& requestedProfile, int target_led_count) {
+    std::vector<Zone> raw_zones;
     char userPath[MAX_PATH] = {};
     GetEnvironmentVariableA("USERPROFILE", userPath, MAX_PATH);
 
@@ -205,7 +221,7 @@ static std::vector<Zone> load_prismatik_profile(const std::string& requestedProf
     if (requestedProfile.find('\\') != std::string::npos || requestedProfile.find('/') != std::string::npos) {
         candidates.push_back(requestedProfile);
     } else {
-        // 1. Check project profiles/ directory first
+        // 1. Check local project profiles/ folder
         candidates.push_back("profiles\\" + profileName);
         if (profileName.find(".ini") == std::string::npos) {
             candidates.push_back("profiles\\" + profileName + ".ini");
@@ -213,7 +229,7 @@ static std::vector<Zone> load_prismatik_profile(const std::string& requestedProf
         candidates.push_back("profiles\\Movies.ini");
         candidates.push_back("profiles\\Lightpack.ini");
 
-        // 2. Check Prismatik user directory
+        // 2. Check Prismatik directory
         candidates.push_back(prismatikDir + profileName);
         if (profileName.find(".ini") == std::string::npos) {
             candidates.push_back(prismatikDir + profileName + ".ini");
@@ -222,11 +238,12 @@ static std::vector<Zone> load_prismatik_profile(const std::string& requestedProf
         candidates.push_back(prismatikDir + "Lightpack.ini");
     }
 
+    bool loaded = false;
     for (auto& path : candidates) {
         std::ifstream f(path);
         if (!f.is_open()) continue;
 
-        zones.clear();
+        raw_zones.clear();
         int px = 0, py = 0, sw = 50, sh = 50;
         bool inLed = false;
         std::string line;
@@ -235,7 +252,7 @@ static std::vector<Zone> load_prismatik_profile(const std::string& requestedProf
             if (!line.empty() && line.back() == '\r') line.pop_back();
 
             if (line.rfind("[LED_", 0) == 0) {
-                if (inLed) zones.push_back({px, py, sw, sh});
+                if (inLed) raw_zones.push_back({px, py, sw, sh});
                 inLed = true;
                 px = py = 0; sw = sh = 50;
             } else if (inLed) {
@@ -245,22 +262,37 @@ static std::vector<Zone> load_prismatik_profile(const std::string& requestedProf
                     sscanf_s(line.c_str(), "Size=@Size(%d %d)", &sw, &sh);
             }
         }
-        if (inLed) zones.push_back({px, py, sw, sh});
+        if (inLed) raw_zones.push_back({px, py, sw, sh});
 
-        if (!zones.empty()) {
-            if ((int)zones.size() > max_allowed_leds) {
-                log_msg("Parsed " + std::to_string(zones.size()) + " zones from " + path +
-                        ", capping to active Segment 0 count (" + std::to_string(max_allowed_leds) + ").");
-                zones.resize(max_allowed_leds);
-            } else {
-                log_msg("Loaded " + std::to_string(zones.size()) + " LED zones from " + path);
-            }
-            return zones;
+        if (!raw_zones.empty()) {
+            log_msg("Loaded " + std::to_string(raw_zones.size()) + " raw zones from " + path);
+            loaded = true;
+            break;
         }
     }
 
-    log_msg("Using embedded Movies.ini 109-zone profile fallback.");
-    return std::vector<Zone>(MOVIES_PROFILE_ZONES, MOVIES_PROFILE_ZONES + SEG0_COUNT);
+    if (!loaded || raw_zones.empty()) {
+        log_msg("Using embedded Movies.ini profile fallback.");
+        raw_zones.assign(MOVIES_PROFILE_ZONES, MOVIES_PROFILE_ZONES + 109);
+    }
+
+    if (target_led_count <= 0) target_led_count = (int)raw_zones.size();
+
+    // Dynamically map/interpolate raw profile zones to target screen LED count
+    std::vector<Zone> scaled_zones(target_led_count);
+    if ((int)raw_zones.size() == target_led_count) {
+        scaled_zones = raw_zones;
+    } else {
+        log_msg("Scaling " + std::to_string(raw_zones.size()) + " profile zones -> " +
+                std::to_string(target_led_count) + " target screen LEDs.");
+        for (int i = 0; i < target_led_count; i++) {
+            float src_idx_f = ((float)i / (float)target_led_count) * (float)raw_zones.size();
+            int src_idx = min((int)raw_zones.size() - 1, (int)src_idx_f);
+            scaled_zones[i] = raw_zones[src_idx];
+        }
+    }
+
+    return scaled_zones;
 }
 
 // ---------------------------------------------------------------------------
@@ -411,82 +443,108 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// Sim Racing Telemetry Shift Lights Renderer (Percentage of Car Redline)
+// Universal Dynamic Shift Lights Renderer (Dual-Bar & Single-Bar)
 // ---------------------------------------------------------------------------
-static void render_rev_meter(std::vector<uint8_t>& pkt, float rpm_pct, bool is_limiter, bool flash_state) {
-    // Professional SimHub-standard RPM scaling:
-    //   - 0.00 .. 0.65 : OFF (Ambient driving)
-    //   - 0.65 .. 0.75 : Green (Outer tips)
-    //   - 0.75 .. 0.88 : Yellow (Middle)
-    //   - 0.88 .. 0.95 : Red (Center)
-    //   - >= 0.96      : Flashing Shift Light / Limiter
+static void render_rev_meter(std::vector<uint8_t>& pkt, const HardwareLayout& hw, float rpm_pct, bool is_limiter, bool flash_state) {
     const float REV_START_PCT = 0.65f;
     const float REV_FULL_PCT  = 0.95f;
     const float REV_LIMIT_PCT = 0.96f;
 
-    uint8_t flash_r = 0, flash_g = 100, flash_b = 255; // Flashing Blue on limiter/shift
+    uint8_t flash_r = 0, flash_g = 100, flash_b = 255;
 
+    // Helper lambda to set physical LED color
+    auto set_led = [&](int physical_idx, uint8_t r, uint8_t g, uint8_t b) {
+        if (physical_idx >= 0 && physical_idx < hw.total_leds) {
+            int p = 4 + physical_idx * 3;
+            pkt[p] = r; pkt[p + 1] = g; pkt[p + 2] = b;
+        }
+    };
+
+    // Case 1: Limiter / Shift Flash State
     if (is_limiter || rpm_pct >= REV_LIMIT_PCT) {
         uint8_t cr = flash_state ? flash_r : 0;
         uint8_t cg = flash_state ? flash_g : 0;
         uint8_t cb = flash_state ? flash_b : 0;
 
-        for (int i = 0; i < SEG1_COUNT; i++) {
-            int seg1_idx = 4 + i * 3;
-            pkt[seg1_idx] = cr; pkt[seg1_idx + 1] = cg; pkt[seg1_idx + 2] = cb;
-        }
-        for (int i = 0; i < SEG2_COUNT; i++) {
-            int seg2_idx = 4 + (126 + (17 - i)) * 3;
-            pkt[seg2_idx] = cr; pkt[seg2_idx + 1] = cg; pkt[seg2_idx + 2] = cb;
+        if (hw.seg1_start >= 0 && hw.seg2_start >= 0) {
+            for (int i = 0; i < hw.seg1_count; i++) set_led(hw.seg1_start + i, cr, cg, cb);
+            for (int i = 0; i < hw.seg2_count; i++) set_led(hw.seg2_start + i, cr, cg, cb);
+        } else if (hw.single_start >= 0) {
+            for (int i = 0; i < hw.single_count; i++) set_led(hw.single_start + i, cr, cg, cb);
         }
         return;
     }
 
+    // Case 2: Below threshold -> Turn off lightbar LEDs
     if (rpm_pct < REV_START_PCT) {
-        // Below start threshold: turn off rev lights
-        for (int i = 0; i < SEG1_COUNT; i++) {
-            int seg1_idx = 4 + i * 3;
-            pkt[seg1_idx] = pkt[seg1_idx + 1] = pkt[seg1_idx + 2] = 0;
-        }
-        for (int i = 0; i < SEG2_COUNT; i++) {
-            int seg2_idx = 4 + (126 + (17 - i)) * 3;
-            pkt[seg2_idx] = pkt[seg2_idx + 1] = pkt[seg2_idx + 2] = 0;
+        if (hw.seg1_start >= 0 && hw.seg2_start >= 0) {
+            for (int i = 0; i < hw.seg1_count; i++) set_led(hw.seg1_start + i, 0, 0, 0);
+            for (int i = 0; i < hw.seg2_count; i++) set_led(hw.seg2_start + i, 0, 0, 0);
+        } else if (hw.single_start >= 0) {
+            for (int i = 0; i < hw.single_count; i++) set_led(hw.single_start + i, 0, 0, 0);
         }
         return;
     }
 
     float span = REV_FULL_PCT - REV_START_PCT;
     float norm = (span > 0.0f) ? max(0.0f, min(1.0f, (rpm_pct - REV_START_PCT) / span)) : 0.0f;
-    int lit_left  = (int)std::round(norm * (float)SEG1_COUNT);
-    int lit_right = (int)std::round(norm * (float)SEG2_COUNT);
 
-    // Left side (Seg 1: LEDs 0..16, 17 LEDs total)
-    for (int i = 0; i < SEG1_COUNT; i++) {
-        int seg1_idx = 4 + i * 3;
-        if (i < lit_left) {
-            uint8_t cr = 0, cg = 0, cb = 0;
-            if (i < 6)       { cr = 0;   cg = 255; cb = 0; }   // Green outer tip
-            else if (i < 13) { cr = 255; cg = 165; cb = 0; } // Yellow middle
-            else             { cr = 255; cg = 0;   cb = 0; } // Red center
+    // Dual Bar Mode (Outer tips -> Center redline)
+    if (hw.seg1_start >= 0 && hw.seg2_start >= 0) {
+        int lit_left  = (int)std::round(norm * (float)hw.seg1_count);
+        int lit_right = (int)std::round(norm * (float)hw.seg2_count);
 
-            pkt[seg1_idx] = cr; pkt[seg1_idx + 1] = cg; pkt[seg1_idx + 2] = cb;
-        } else {
-            pkt[seg1_idx] = 0;  pkt[seg1_idx + 1] = 0;  pkt[seg1_idx + 2] = 0;
+        // Left Bar
+        for (int i = 0; i < hw.seg1_count; i++) {
+            int led_offset = hw.seg1_rev ? (hw.seg1_count - 1 - i) : i;
+            int phys_idx = hw.seg1_start + led_offset;
+
+            if (i < lit_left) {
+                float pos_pct = (float)i / (float)hw.seg1_count;
+                uint8_t cr = 0, cg = 0, cb = 0;
+                if (pos_pct < 0.35f)       { cr = 0;   cg = 255; cb = 0; }   // Green outer tip
+                else if (pos_pct < 0.75f)  { cr = 255; cg = 165; cb = 0; } // Yellow middle
+                else                       { cr = 255; cg = 0;   cb = 0; } // Red center
+                set_led(phys_idx, cr, cg, cb);
+            } else {
+                set_led(phys_idx, 0, 0, 0);
+            }
+        }
+
+        // Right Bar
+        for (int i = 0; i < hw.seg2_count; i++) {
+            int led_offset = hw.seg2_rev ? i : (hw.seg2_count - 1 - i);
+            int phys_idx = hw.seg2_start + led_offset;
+
+            if (i < lit_right) {
+                float pos_pct = (float)i / (float)hw.seg2_count;
+                uint8_t cr = 0, cg = 0, cb = 0;
+                if (pos_pct < 0.35f)       { cr = 0;   cg = 255; cb = 0; }   // Green outer tip
+                else if (pos_pct < 0.75f)  { cr = 255; cg = 165; cb = 0; } // Yellow middle
+                else                       { cr = 255; cg = 0;   cb = 0; } // Red center
+                set_led(phys_idx, cr, cg, cb);
+            } else {
+                set_led(phys_idx, 0, 0, 0);
+            }
         }
     }
+    // Single Bar Mode (Left -> Right continuous sweep)
+    else if (hw.single_start >= 0) {
+        int lit = (int)std::round(norm * (float)hw.single_count);
+        for (int i = 0; i < hw.single_count; i++) {
+            int led_offset = hw.single_rev ? (hw.single_count - 1 - i) : i;
+            int phys_idx = hw.single_start + led_offset;
 
-    // Right side (Seg 2: LEDs 126..143, 18 LEDs total)
-    for (int i = 0; i < SEG2_COUNT; i++) {
-        int seg2_idx = 4 + (126 + (17 - i)) * 3;
-        if (i < lit_right) {
-            uint8_t cr = 0, cg = 0, cb = 0;
-            if (i < 6)       { cr = 0;   cg = 255; cb = 0; }   // Green outer tip
-            else if (i < 14) { cr = 255; cg = 165; cb = 0; } // Yellow middle
-            else             { cr = 255; cg = 0;   cb = 0; } // Red center
-
-            pkt[seg2_idx] = cr; pkt[seg2_idx + 1] = cg; pkt[seg2_idx + 2] = cb;
-        } else {
-            pkt[seg2_idx] = 0;  pkt[seg2_idx + 1] = 0;  pkt[seg2_idx + 2] = 0;
+            if (i < lit) {
+                float pos_pct = (float)i / (float)hw.single_count;
+                uint8_t cr = 0, cg = 0, cb = 0;
+                if (pos_pct < 0.35f)       { cr = 0;   cg = 255; cb = 0; }
+                else if (pos_pct < 0.75f)  { cr = 255; cg = 165; cb = 0; }
+                else                       { cr = 255; cg = 0;   cb = 0; }
+                set_led(phys_idx, cr, cg, cb);
+            } else {
+                set_led(phys_idx, 0, 0, 0);
+            }
         }
     }
 }
@@ -499,22 +557,47 @@ int main(int argc, char* argv[]) {
 
     std::string wled_ip     = "10.103.233.251";
     float target_fps        = DEFAULT_FPS;
-    int start_led_offset    = 0;         // Send FULL 150-LED strip starting at LED 0!
     std::string profile_req = "Movies.ini";
+    HardwareLayout hw;
 
+    // CLI Parameter Parsing:
+    // argv[1]: wled_ip
+    // argv[2]: target_fps
+    // argv[3]: profile_req
+    // argv[4]: total_leds
+    // argv[5]: seg0_start, argv[6]: seg0_count
+    // argv[7]: seg1_start, argv[8]: seg1_count, argv[9]: seg1_rev
+    // argv[10]: seg2_start, argv[11]: seg2_count, argv[12]: seg2_rev
+    // argv[13]: single_start, argv[14]: single_count, argv[15]: single_rev
+    // argv[16]: seg3_start, argv[17]: seg3_count
     if (argc > 1) wled_ip = argv[1];
     if (argc > 2) target_fps = (float)std::atof(argv[2]);
-    if (argc > 3) start_led_offset = std::atoi(argv[3]);
-    if (argc > 4) profile_req = argv[4];
+    if (argc > 3) profile_req = argv[3];
+    if (argc > 4) hw.total_leds = std::atoi(argv[4]);
+    if (argc > 6) { hw.seg0_start = std::atoi(argv[5]); hw.seg0_count = std::atoi(argv[6]); }
+    if (argc > 9) { hw.seg1_start = std::atoi(argv[7]); hw.seg1_count = std::atoi(argv[8]); hw.seg1_rev = (std::atoi(argv[9]) != 0); }
+    if (argc > 12) { hw.seg2_start = std::atoi(argv[10]); hw.seg2_count = std::atoi(argv[11]); hw.seg2_rev = (std::atoi(argv[12]) != 0); }
+    if (argc > 15) { hw.single_start = std::atoi(argv[13]); hw.single_count = std::atoi(argv[14]); hw.single_rev = (std::atoi(argv[15]) != 0); }
+    if (argc > 17) { hw.seg3_start = std::atoi(argv[16]); hw.seg3_count = std::atoi(argv[17]); }
 
     if (target_fps <= 0.0f) target_fps = DEFAULT_FPS;
-    if (start_led_offset < 0) start_led_offset = 0;
+    if (hw.total_leds <= 0) hw.total_leds = 150;
 
     timeBeginPeriod(1);
-    log_msg("=== RoomLights 100% Native C++ Multi-Game Engine Started ===");
+    log_msg("=== RoomLights 100% Native C++ Universal Engine Started ===");
     log_msg("Target WLED: " + wled_ip + ":" + std::to_string(WLED_PORT));
-    log_msg("Full Physical LED Strip Payload: " + std::to_string(TOTAL_LEDS) + " LEDs starting at offset " + std::to_string(start_led_offset));
-    log_msg("Target Rate: " + std::to_string((int)target_fps) + " FPS");
+    log_msg("Dynamic Total Strip Length: " + std::to_string(hw.total_leds) + " LEDs");
+    log_msg("Seg 0 (Screen Ambient): Start=" + std::to_string(hw.seg0_start) + ", Count=" + std::to_string(hw.seg0_count));
+    if (hw.seg1_start >= 0 && hw.seg2_start >= 0) {
+        log_msg("Dual Lightbar: Seg1 Start=" + std::to_string(hw.seg1_start) + ", Count=" + std::to_string(hw.seg1_count) +
+                (hw.seg1_rev ? " [REV]" : "") + " | Seg2 Start=" + std::to_string(hw.seg2_start) + ", Count=" + std::to_string(hw.seg2_count) +
+                (hw.seg2_rev ? " [REV]" : ""));
+    } else if (hw.single_start >= 0) {
+        log_msg("Single Lightbar: Start=" + std::to_string(hw.single_start) + ", Count=" + std::to_string(hw.single_count));
+    }
+    if (hw.seg3_start >= 0) {
+        log_msg("Seg 3 (Aux/Pomodoro): Start=" + std::to_string(hw.seg3_start) + ", Count=" + std::to_string(hw.seg3_count));
+    }
 
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -526,16 +609,15 @@ int main(int argc, char* argv[]) {
     dest.sin_port   = htons(WLED_PORT);
     inet_pton(AF_INET, wled_ip.c_str(), &dest.sin_addr);
 
-    // Load Prismatik Movies profile (109 LEDs for Segment 0)
-    auto zones = load_prismatik_profile(profile_req, SEG0_COUNT);
+    // Dynamically load & scale profile zones to match the discovered screen segment count
+    auto zones = load_prismatik_profile(profile_req, hw.seg0_count);
 
-    // Pre-allocate FULL 150-LED strip packet: 4 byte header + 150 * 3 = 454 bytes
-    // DNRGB Header: [0x04=DNRGB, timeout_sec, start_hi, start_lo, R0, G0, B0, ...]
-    std::vector<uint8_t> pkt(4 + TOTAL_LEDS * 3, 0);
+    // Dynamically allocate WLED UDP DNRGB packet buffer
+    std::vector<uint8_t> pkt(4 + hw.total_leds * 3, 0);
     pkt[0] = 0x04;
     pkt[1] = (uint8_t)KEEPALIVE_SEC;
-    pkt[2] = (uint8_t)((start_led_offset >> 8) & 0xFF);
-    pkt[3] = (uint8_t)(start_led_offset & 0xFF);
+    pkt[2] = 0x00; // Start at LED offset 0
+    pkt[3] = 0x00;
 
     ID3D11Device*        d3dDev  = nullptr;
     ID3D11DeviceContext* d3dCtx  = nullptr;
@@ -601,7 +683,8 @@ int main(int argc, char* argv[]) {
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
 
-    log_msg("100% Native C++ Capture & Multi-Game Telemetry Loop Active (150 LEDs, 454 byte UDP DNRGB packet @ 60 FPS).");
+    log_msg("Universal C++ Pipeline Active (" + std::to_string(hw.total_leds) +
+            " LEDs, " + std::to_string(pkt.size()) + " byte UDP DNRGB packet @ 60 FPS).");
 
     uint64_t total_packets = 0;
     auto last_stat_log = std::chrono::steady_clock::now();
@@ -611,6 +694,13 @@ int main(int argc, char* argv[]) {
 
     DXGI_OUTDUPL_FRAME_INFO frameInfo{};
     IDXGIResource* res = nullptr;
+
+    auto set_led = [&](int physical_idx, uint8_t r, uint8_t g, uint8_t b) {
+        if (physical_idx >= 0 && physical_idx < hw.total_leds) {
+            int p = 4 + physical_idx * 3;
+            pkt[p] = r; pkt[p + 1] = g; pkt[p + 2] = b;
+        }
+    };
 
     while (true) {
         QueryPerformanceCounter(&t0);
@@ -630,59 +720,56 @@ int main(int argc, char* argv[]) {
 
         if (ac_active && ac_rpm > 0.0f) {
             // Priority 1: Assetto Corsa Native Shared Memory
-            render_rev_meter(pkt, ac_rpm, ac_limiter, flash_state);
+            render_rev_meter(pkt, hw, ac_rpm, ac_limiter, flash_state);
         } else if (ipc && ipc->lightbar_mode == 1 && ipc->rpm_pct > 0.0f) {
-            // Priority 2: Universal Sim Racing Telemetry (F1 23/24/25, AMS2, Forza, iRacing) via IPC
-            render_rev_meter(pkt, ipc->rpm_pct, ipc->is_limiter != 0, flash_state);
+            // Priority 2: Universal Sim Racing Telemetry (F1, AMS2, Forza, iRacing) via IPC
+            render_rev_meter(pkt, hw, ipc->rpm_pct, ipc->is_limiter != 0, flash_state);
         } else if (ipc && ipc->lightbar_mode == 2 && (ipc->ds4_r + ipc->ds4_g + ipc->ds4_b) > 0) {
             // Priority 3: PlayStation DS4 Controller Lightbar Game Color
-            for (int i = 0; i < SEG1_COUNT; i++) {
-                int idx = 4 + i * 3;
-                pkt[idx] = ipc->ds4_r; pkt[idx+1] = ipc->ds4_g; pkt[idx+2] = ipc->ds4_b;
-            }
-            for (int i = 0; i < SEG2_COUNT; i++) {
-                int idx = 4 + (126 + (17 - i)) * 3;
-                pkt[idx] = ipc->ds4_r; pkt[idx+1] = ipc->ds4_g; pkt[idx+2] = ipc->ds4_b;
+            if (hw.seg1_start >= 0 && hw.seg2_start >= 0) {
+                for (int i = 0; i < hw.seg1_count; i++) set_led(hw.seg1_start + i, ipc->ds4_r, ipc->ds4_g, ipc->ds4_b);
+                for (int i = 0; i < hw.seg2_count; i++) set_led(hw.seg2_start + i, ipc->ds4_r, ipc->ds4_g, ipc->ds4_b);
+            } else if (hw.single_start >= 0) {
+                for (int i = 0; i < hw.single_count; i++) set_led(hw.single_start + i, ipc->ds4_r, ipc->ds4_g, ipc->ds4_b);
             }
         } else if (ipc && ipc->lightbar_mode == 3) {
             // Priority 4: Custom Lightbar Array (CS2 Flashes, Health Pulses, Bomb timer)
-            for (int i = 0; i < SEG1_COUNT; i++) {
-                int idx = 4 + i * 3;
-                pkt[idx] = ipc->seg1_rgb[i*3]; pkt[idx+1] = ipc->seg1_rgb[i*3+1]; pkt[idx+2] = ipc->seg1_rgb[i*3+2];
-            }
-            for (int i = 0; i < SEG2_COUNT; i++) {
-                int idx = 4 + (126 + (17 - i)) * 3;
-                pkt[idx] = ipc->seg2_rgb[i*3]; pkt[idx+1] = ipc->seg2_rgb[i*3+1]; pkt[idx+2] = ipc->seg2_rgb[i*3+2];
+            if (hw.seg1_start >= 0 && hw.seg2_start >= 0) {
+                for (int i = 0; i < min(hw.seg1_count, 17); i++) {
+                    set_led(hw.seg1_start + i, ipc->seg1_rgb[i*3], ipc->seg1_rgb[i*3+1], ipc->seg1_rgb[i*3+2]);
+                }
+                for (int i = 0; i < min(hw.seg2_count, 18); i++) {
+                    set_led(hw.seg2_start + i, ipc->seg2_rgb[i*3], ipc->seg2_rgb[i*3+1], ipc->seg2_rgb[i*3+2]);
+                }
+            } else if (hw.single_start >= 0) {
+                for (int i = 0; i < min(hw.single_count, 35); i++) {
+                    if (i < 17) set_led(hw.single_start + i, ipc->seg1_rgb[i*3], ipc->seg1_rgb[i*3+1], ipc->seg1_rgb[i*3+2]);
+                    else        set_led(hw.single_start + i, ipc->seg2_rgb[(i-17)*3], ipc->seg2_rgb[(i-17)*3+1], ipc->seg2_rgb[(i-17)*3+2]);
+                }
             }
         } else {
-            // Idle / Off on Seg 1 & 2
-            for (int i = 0; i < SEG1_COUNT; i++) {
-                int idx = 4 + i * 3;
-                pkt[idx] = pkt[idx+1] = pkt[idx+2] = 0;
-            }
-            for (int i = 0; i < SEG2_COUNT; i++) {
-                int idx = 4 + (126 + (17 - i)) * 3;
-                pkt[idx] = pkt[idx+1] = pkt[idx+2] = 0;
+            // Idle / Off on lightbar LEDs
+            if (hw.seg1_start >= 0 && hw.seg2_start >= 0) {
+                for (int i = 0; i < hw.seg1_count; i++) set_led(hw.seg1_start + i, 0, 0, 0);
+                for (int i = 0; i < hw.seg2_count; i++) set_led(hw.seg2_start + i, 0, 0, 0);
+            } else if (hw.single_start >= 0) {
+                for (int i = 0; i < hw.single_count; i++) set_led(hw.single_start + i, 0, 0, 0);
             }
         }
 
-        // Segment 3 (Pomodoro / Aux - LEDs 144..149)
-        if (ipc) {
-            for (int i = 0; i < SEG3_COUNT; i++) {
-                int idx = 4 + (144 + i) * 3;
-                pkt[idx]   = ipc->seg3_rgb[i*3];
-                pkt[idx+1] = ipc->seg3_rgb[i*3+1];
-                pkt[idx+2] = ipc->seg3_rgb[i*3+2];
+        // Segment 3 (Pomodoro / Aux)
+        if (ipc && hw.seg3_start >= 0) {
+            for (int i = 0; i < min(hw.seg3_count, 6); i++) {
+                set_led(hw.seg3_start + i, ipc->seg3_rgb[i*3], ipc->seg3_rgb[i*3+1], ipc->seg3_rgb[i*3+2]);
             }
         }
 
-        // 2. Process DXGI Desktop Duplication Screen Capture for Segment 0 (LEDs 17..125)
+        // 2. Process DXGI Desktop Duplication Screen Capture for Segment 0
         if (!dupl) {
             if (std::chrono::duration_cast<std::chrono::milliseconds>(now_steady - last_dupl_retry).count() >= 500) {
                 last_dupl_retry = now_steady;
                 output1->DuplicateOutput(d3dDev, &dupl);
             }
-            // Still transmit full packet with rev meter / ambient keepalive
             sendto(sock, (const char*)pkt.data(), (int)pkt.size(), 0, (sockaddr*)&dest, sizeof(dest));
             total_packets++;
             goto frame_done;
@@ -693,14 +780,12 @@ int main(int argc, char* argv[]) {
         hr = dupl->AcquireNextFrame(0, &frameInfo, &res);
 
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            // Screen didn't change: re-send packet immediately with 0 delay
             sendto(sock, (const char*)pkt.data(), (int)pkt.size(), 0, (sockaddr*)&dest, sizeof(dest));
             total_packets++;
             goto frame_done;
         }
 
         if (FAILED(hr)) {
-            // Access lost / mode change: non-blocking cleanup
             if (dupl) { dupl->Release(); dupl = nullptr; }
             sendto(sock, (const char*)pkt.data(), (int)pkt.size(), 0, (sockaddr*)&dest, sizeof(dest));
             total_packets++;
@@ -722,7 +807,7 @@ int main(int argc, char* argv[]) {
                 const uint8_t* px = (const uint8_t*)mapped.pData;
                 int rp            = mapped.RowPitch;
 
-                for (int i = 0; i < SEG0_COUNT; i++) {
+                for (int i = 0; i < hw.seg0_count; i++) {
                     const Zone& z = zones[i];
                     int x1 = max(0, min(fullW - 1, z.x));
                     int y1 = max(0, min(fullH - 1, z.y));
@@ -747,16 +832,17 @@ int main(int argc, char* argv[]) {
                         float g = sumG / (count * 255.0f);
                         float b = sumB / (count * 255.0f);
 
-                        // Offset 17 for Segment 0 physical LEDs
-                        int target_led_idx = 17 + i;
-                        int pkt_idx = 4 + target_led_idx * 3;
-                        process_pixel(r, g, b, pkt[pkt_idx], pkt[pkt_idx + 1], pkt[pkt_idx + 2]);
+                        int target_phys_idx = hw.seg0_start + i;
+                        int pkt_idx = 4 + target_phys_idx * 3;
+                        if (target_phys_idx >= 0 && target_phys_idx < hw.total_leds) {
+                            process_pixel(r, g, b, pkt[pkt_idx], pkt[pkt_idx + 1], pkt[pkt_idx + 2]);
+                        }
                     }
                 }
 
                 d3dCtx->Unmap(stagingTex, 0);
 
-                // Send non-blocking UDP DNRGB frame covering the entire 150-LED strip
+                // Send non-blocking UDP DNRGB frame covering the entire strip
                 int bytesSent = sendto(sock, (const char*)pkt.data(), (int)pkt.size(),
                                        0, (sockaddr*)&dest, sizeof(dest));
                 if (bytesSent > 0) {
@@ -773,7 +859,7 @@ int main(int argc, char* argv[]) {
                     else if (ipc && ipc->lightbar_mode == 2) { active_source = "DS4_LIGHTBAR"; }
                     else if (ipc && ipc->lightbar_mode == 3) { active_source = "CUSTOM_ARRAY"; }
 
-                    log_msg("Native C++ UDP Stats: Sent " + std::to_string(total_packets) +
+                    log_msg("Universal C++ Stats: Sent " + std::to_string(total_packets) +
                             " packets. ActiveSource=" + active_source +
                             ", RPM=" + std::to_string(cur_rpm * 100.0f) + "%");
                 }
@@ -781,7 +867,6 @@ int main(int argc, char* argv[]) {
         }
 
 frame_done:
-        // High-precision hybrid frame pacing (sleep for majority, spin for final 1ms)
         QueryPerformanceCounter(&t1);
         double elapsed_ms = (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
         double wait_ms    = frameInterval_ms - elapsed_ms;

@@ -72,6 +72,7 @@ WLED_TIMEOUT: float = 1.0    # seconds
 SEG0_ID: int = _int("SEGMENT_SCREEN_CAPTURE", 0)   # Screen ambient (Main segment on UDP)
 SEG1_ID: int = _int("SEGMENT_LIGHTBAR_LEFT", 1)    # Left lightbar half (LEDs 0..17)
 SEG2_ID: int = _int("SEGMENT_LIGHTBAR_RIGHT", 2)   # Right lightbar half (LEDs 126..144)
+SEG_LIGHTBAR_ID: int = _int("SEGMENT_LIGHTBAR", -1) # Single lightbar alternative (-1 if using dual-bar)
 SEG3_ID: int = _int("SEGMENT_POMODORO", 3)         # Pomodoro timer (LEDs 144..150)
 
 # Physical LED Start Offset for Screen Ambient Capture Stream (default 17)
