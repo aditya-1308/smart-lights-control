@@ -93,7 +93,7 @@ class WLEDClient:
             log.debug("WLED unexpected error: %s", exc)
             return False
 
-    async def fetch_segment_info(self) -> dict:
+    async def fetch_segment_info(self, timeout_sec: float = 5.0) -> dict:
         """
         Query WLED's current segment configuration dynamically over HTTP.
 
@@ -103,40 +103,43 @@ class WLEDClient:
         if self._session is None or self._session.closed:
             await self.start()
 
-        try:
-            async with self._session.get(config.WLED_STATE_URL) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # WLED returns state wrapped in state object or root
-                    state_obj = data.get("state", data)
-                    segs = state_obj.get("seg", [])
-                    result = {}
-                    for s in segs:
-                        seg_id = s.get("id", 0)
-                        start = s.get("start", 0)
-                        stop = s.get("stop", 0)
-                        length = s.get("len", max(0, stop - start))
-                        rev = s.get("rev", False)
-                        on = s.get("on", True)
-                        result[seg_id] = {
-                            "len": length,
-                            "start": start,
-                            "stop": stop,
-                            "rev": rev,
-                            "on": on,
-                        }
-                    if result:
-                        log.info("Auto-discovered %d segments from WLED at %s:",
-                                 len(result), config.WLED_IP)
-                        for sid, sinfo in result.items():
-                            log.info("  Seg %d: %d LEDs (idx %d..%d)%s",
-                                     sid, sinfo["len"], sinfo["start"], sinfo["stop"],
-                                     " [REVERSED]" if sinfo["rev"] else "")
-                    return result
-                return {}
-        except Exception as exc:
-            log.warning("Could not auto-discover WLED segments (%s). Using config defaults.", exc)
-            return {}
+        timeout = aiohttp.ClientTimeout(total=timeout_sec)
+        for attempt in range(2):
+            try:
+                async with self._session.get(config.WLED_STATE_URL, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        state_obj = data.get("state", data)
+                        segs = state_obj.get("seg", [])
+                        result = {}
+                        for s in segs:
+                            seg_id = s.get("id", 0)
+                            start = s.get("start", 0)
+                            stop = s.get("stop", 0)
+                            length = s.get("len", max(0, stop - start))
+                            rev = s.get("rev", False)
+                            on = s.get("on", True)
+                            result[seg_id] = {
+                                "len": length,
+                                "start": start,
+                                "stop": stop,
+                                "rev": rev,
+                                "on": on,
+                            }
+                        if result:
+                            log.info("Auto-discovered %d segments from WLED at %s:",
+                                     len(result), config.WLED_IP)
+                            for sid, sinfo in result.items():
+                                log.info("  Seg %d: %d LEDs (idx %d..%d)%s",
+                                         sid, sinfo["len"], sinfo["start"], sinfo["stop"],
+                                         " [REVERSED]" if sinfo["rev"] else "")
+                            return result
+            except Exception as exc:
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
+                else:
+                    log.warning("Could not auto-discover WLED segments (%s). Using config defaults.", exc)
+        return {}
 
 
     # -----------------------------------------------------------------

@@ -149,15 +149,16 @@ async def _run_cpp_binary(binary: Path) -> bool:
     """
     from wled_api import WLEDClient
 
-    # 1. Discover live segment bounds from WLED over HTTP
-    seg_info = {}
-    try:
-        async with WLEDClient() as wled:
-            seg_info = await wled.fetch_segment_info()
-            if seg_info:
-                state.set_discovered_segments(seg_info)
-    except Exception as exc:
-        log.warning("Could not query WLED segments (%s). Using defaults.", exc)
+    # 1. Discover live segment bounds from WLED over HTTP (or use already-discovered cache)
+    seg_info = dict(state.wled_segments)
+    if not seg_info:
+        try:
+            async with WLEDClient() as wled:
+                seg_info = await wled.fetch_segment_info(timeout_sec=5.0)
+                if seg_info:
+                    state.set_discovered_segments(seg_info)
+        except Exception as exc:
+            log.warning("Could not query WLED segments (%s). Using defaults.", exc)
 
     # Calculate total physical strip length
     total_leds = 150
