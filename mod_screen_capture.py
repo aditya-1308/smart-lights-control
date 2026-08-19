@@ -1,14 +1,20 @@
 """
-mod_screen_capture.py - Low-Latency Realtime Screen Ambient Capture for Segment 0.
+mod_screen_capture.py
 
-Architecture:
-  - Runs a dedicated background thread for capture + processing (no asyncio.to_thread overhead).
-  - DXcam with max_buffer_len=1 (zero queue backlog, frames always fresh).
-  - Windows High-Precision Timer (timeBeginPeriod(1)) for 1ms scheduler resolution.
-  - Prismatik calibration profile for exact zone coordinates.
-  - Vectorized NumPy color averaging + hardware gamma correction.
-  - Non-blocking UDP DNRGB packets to WLED Port 21324.
-  - Sends keepalive UDP packets when no frame is available to prevent WLED reverting to defaults.
+Launches the native C++ capture engine (cpp/roomlights_capture.exe) as a subprocess.
+The C++ binary does the real work identically to Prismatik's DDuplGrabber:
+  - DXGI Desktop Duplication, AcquireNextFrame(timeout=0) (non-blocking)
+  - GPU mip-chain /8 downscale before CPU readback
+  - Direct UDP DNRGB to WLED
+
+Falls back to a pure-Python implementation using dxcam / mss if the binary
+is not compiled yet.
+
+Build the binary:
+  cd cpp
+  cmake -B build -G "Visual Studio 17 2022" -A x64
+  cmake --build build --config Release
+  copy build\\Release\\RoomLightsCapture.exe roomlights_capture.exe
 """
 
 import asyncio
@@ -17,6 +23,8 @@ import logging
 import os
 import re
 import socket
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -30,12 +38,11 @@ from state import state, Seg0Source
 log = logging.getLogger("screen_capture")
 RGB = Tuple[int, int, int]
 
-_UDP_PORT = 21324
-# 5-second timeout: WLED holds realtime mode this long after the last packet.
-# Must be > 1/FPS gap to prevent WLED reverting to stored effect between frames.
-_REALTIME_TIMEOUT_SEC = 5
+_UDP_PORT          = 21324
+_REALTIME_TIMEOUT  = 5    # seconds — WLED realtime hold timeout
+_BINARY_NAME       = "roomlights_capture.exe"
 
-# Enable Windows 1ms high-precision scheduler
+# Enable Windows 1ms scheduler precision
 try:
     ctypes.windll.winmm.timeBeginPeriod(1)
 except Exception:
@@ -49,13 +56,9 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Prismatik profile loader
+# Prismatik profile loader (used by Python fallback)
 # ---------------------------------------------------------------------------
 def _load_prismatik_profile() -> Optional[List[Tuple[int, int, int, int]]]:
-    """
-    Load exact LED zone rectangles from active Prismatik profile.
-    Returns list of (y1, y2, x1, x2) integer bounds, length == SEG0_COUNT.
-    """
     prismatik_dir = Path(os.path.expanduser("~")) / "Prismatik"
     main_conf = prismatik_dir / "main.conf"
     profile_name = "Movies"
@@ -99,53 +102,108 @@ def _load_prismatik_profile() -> Optional[List[Tuple[int, int, int, int]]]:
                 zones.append((y, y + h, x, x + w))
 
             if len(zones) == config.SEG0_COUNT:
-                log.info("Loaded %d exact LED zones from Prismatik: %s",
+                log.info("Loaded %d LED zones from Prismatik: %s",
                          len(zones), ini_path.name)
                 return zones
         except Exception as exc:
             log.warning("Could not parse %s: %s", ini_path, exc)
-
     return None
 
 
-def _compute_fallback_zones(h: int, w: int) -> List[Tuple[int, int, int, int]]:
-    """Fallback geometric zones if profile not found."""
-    y_top_start, y_top_end     = int(h * 0.02), int(h * 0.12)
-    y_bot_start, y_bot_end     = int(h * 0.88), int(h * 0.98)
-    x_left_start, x_left_end   = int(w * 0.02), int(w * 0.12)
-    x_right_start, x_right_end = int(w * 0.88), int(w * 0.98)
+def _fallback_zones(h: int, w: int) -> List[Tuple[int, int, int, int]]:
     mid = w // 2
     zones = []
-
     for i in range(18):
-        zones.append((y_bot_start, y_bot_end,
-                      mid + (w - mid) * i // 18,
-                      mid + (w - mid) * (i + 1) // 18))
+        zones.append((int(h*.88), int(h*.98), mid+(w-mid)*i//18, mid+(w-mid)*(i+1)//18))
     for i in range(18):
-        zones.append((h - h * (i + 1) // 18, h - h * i // 18,
-                      x_right_start, x_right_end))
+        zones.append((h-h*(i+1)//18, h-h*i//18, int(w*.88), int(w*.98)))
     for i in range(36):
-        zones.append((y_top_start, y_top_end,
-                      w - w * (i + 1) // 36, w - w * i // 36))
+        zones.append((int(h*.02), int(h*.12), w-w*(i+1)//36, w-w*i//36))
     for i in range(18):
-        zones.append((h * i // 18, h * (i + 1) // 18,
-                      x_left_start, x_left_end))
+        zones.append((h*i//18, h*(i+1)//18, int(w*.02), int(w*.12)))
     for i in range(19):
-        zones.append((y_bot_start, y_bot_end,
-                      mid * i // 19, mid * (i + 1) // 19))
+        zones.append((int(h*.88), int(h*.98), mid*i//19, mid*(i+1)//19))
     return zones
 
 
 # ---------------------------------------------------------------------------
-# Screen capture engine (runs in a dedicated thread)
+# C++ subprocess launcher
 # ---------------------------------------------------------------------------
-class ScreenCaptureEngine:
-    """
-    Dedicated-thread screen capture engine.
+def _find_binary() -> Optional[Path]:
+    """Look for the pre-built roomlights_capture.exe."""
+    candidates = [
+        Path(__file__).parent / _BINARY_NAME,
+        Path(__file__).parent / "cpp" / _BINARY_NAME,
+        Path(__file__).parent / "cpp" / "build" / "Release" / "RoomLightsCapture.exe",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
 
-    Runs a tight native loop in its own thread instead of asyncio.to_thread
-    to eliminate per-frame executor scheduling overhead (~10-20ms).
+
+async def _run_cpp_binary(binary: Path) -> bool:
     """
+    Launch the C++ capture binary. It streams UDP packets directly to WLED.
+    This coroutine monitors the process and restarts it if it crashes.
+    Returns False if the binary fails immediately (unrecoverable).
+    """
+    cmd = [str(binary), config.WLED_IP, str(config.SCREEN_CAPTURE_FPS)]
+    log.info("Launching C++ capture engine: %s", " ".join(cmd))
+
+    consecutive_failures = 0
+    while not state.shutdown_event.is_set():
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except Exception as exc:
+            log.error("Failed to start C++ capture binary: %s", exc)
+            return False
+
+        # Stream output from the subprocess
+        async def _drain_output():
+            if proc.stdout:
+                async for line in proc.stdout:
+                    log.info("[capture] %s", line.decode(errors="ignore").rstrip())
+
+        drain_task = asyncio.create_task(_drain_output())
+
+        # Wait for process to exit OR shutdown
+        done, _ = await asyncio.wait(
+            [asyncio.create_task(proc.wait()),
+             asyncio.create_task(state.shutdown_event.wait())],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if state.shutdown_event.is_set():
+            proc.terminate()
+            await proc.wait()
+            drain_task.cancel()
+            return True
+
+        ret = proc.returncode
+        drain_task.cancel()
+        consecutive_failures += 1
+
+        if consecutive_failures >= 3:
+            log.error("C++ capture binary crashed %d times. Falling back to Python.",
+                      consecutive_failures)
+            return False
+
+        log.warning("C++ capture binary exited (code %d). Restarting in 2s...", ret)
+        await asyncio.sleep(2.0)
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Python fallback capture engine
+# ---------------------------------------------------------------------------
+class PythonCaptureEngine:
+    """Pure-Python screen capture — used only when C++ binary is not available."""
 
     def __init__(self) -> None:
         self._camera = None
@@ -156,27 +214,17 @@ class ScreenCaptureEngine:
         self._zones: List[Tuple[int, int, int, int]] = []
         self._sock: Optional[socket.socket] = None
         self._running = False
-        self._thread: Optional[threading.Thread] = None
-
-        # Pre-built UDP header for DNRGB protocol:
-        # [0x04=DNRGB, timeout, start_high, start_low]
-        self._header = bytes([0x04, _REALTIME_TIMEOUT_SEC, 0x00, 0x00])
-
-        # Pre-built black keepalive packet (prevents WLED reverting to stored effect)
+        self._header = bytes([0x04, _REALTIME_TIMEOUT, 0x00, 0x00])
         self._keepalive_pkt = self._header + bytes(config.SEG0_COUNT * 3)
 
-    # ------------------------------------------------------------------
     def start(self) -> bool:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setblocking(False)
 
         if _USE_DXCAM:
             try:
-                # max_buffer_len=1 → always get the freshest frame, zero queue lag
                 self._camera = dxcam.create(output_color="BGR", max_buffer_len=1)
-                self._camera.start(target_fps=config.SCREEN_CAPTURE_FPS,
-                                   video_mode=False)
-                # Wait for first frame to get actual resolution
+                self._camera.start(target_fps=config.SCREEN_CAPTURE_FPS, video_mode=False)
                 for _ in range(60):
                     frame = self._camera.get_latest_frame()
                     if frame is not None:
@@ -185,15 +233,15 @@ class ScreenCaptureEngine:
                     time.sleep(0.016)
                 else:
                     self._height, self._width = 1080, 1920
-                log.info("DXcam started @ %d FPS (max_buffer_len=1): %dx%d",
+                log.info("Python fallback: dxcam @ %d FPS: %dx%d",
                          config.SCREEN_CAPTURE_FPS, self._width, self._height)
             except Exception as exc:
-                log.warning("DXcam failed (%s). Falling back to mss.", exc)
+                log.warning("dxcam failed (%s). Trying mss.", exc)
                 return self._start_mss()
         else:
             return self._start_mss()
 
-        self._init_regions()
+        self._init_zones()
         return True
 
     def _start_mss(self) -> bool:
@@ -201,50 +249,40 @@ class ScreenCaptureEngine:
             import mss as mss_mod
             self._sct = mss_mod.mss()
             mon = self._sct.monitors[1]
-            self._width  = mon["width"]
-            self._height = mon["height"]
+            self._width, self._height = mon["width"], mon["height"]
             self._monitor = mon
-            self._init_regions()
-            log.info("mss fallback started: %dx%d", self._width, self._height)
+            self._init_zones()
+            log.info("Python fallback: mss %dx%d", self._width, self._height)
             return True
         except Exception as exc:
             log.error("mss failed: %s", exc)
             return False
 
-    def _init_regions(self) -> None:
+    def _init_zones(self) -> None:
         loaded = _load_prismatik_profile()
-        if loaded is not None and len(loaded) == config.SEG0_COUNT:
+        if loaded and len(loaded) == config.SEG0_COUNT:
             self._zones = loaded
         else:
-            log.warning("Prismatik profile not found or wrong zone count — using fallback.")
-            self._zones = _compute_fallback_zones(self._height, self._width)
-        log.info("Screen capture: %d zones configured.", len(self._zones))
+            self._zones = _fallback_zones(self._height, self._width)
 
-    # ------------------------------------------------------------------
     def stop(self) -> None:
         self._running = False
         if self._camera:
-            try:
-                self._camera.stop()
-            except Exception:
-                pass
+            try: self._camera.stop()
+            except Exception: pass
             self._camera = None
         if self._sct:
-            try:
-                self._sct.close()
-            except Exception:
-                pass
+            try: self._sct.close()
+            except Exception: pass
             self._sct = None
         if self._sock:
             self._sock.close()
             self._sock = None
 
-    # ------------------------------------------------------------------
-    def _capture_frame(self) -> Optional[np.ndarray]:
-        """Grab latest screen frame (blocking, called from capture thread)."""
-        if self._camera is not None:
+    def _grab(self) -> Optional[np.ndarray]:
+        if self._camera:
             return self._camera.get_latest_frame()
-        if self._sct is not None:
+        if self._sct:
             try:
                 raw = self._sct.grab(self._monitor)
                 return np.array(raw, dtype=np.uint8)[:, :, :3]
@@ -252,115 +290,94 @@ class ScreenCaptureEngine:
                 return None
         return None
 
-    def _compute_colors(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Average each zone region and apply gamma + saturation.
-        Returns uint8 array of shape (SEG0_COUNT, 3) in RGB order.
-        """
+    def _compute(self, frame: np.ndarray) -> np.ndarray:
         n = len(self._zones)
         h, w = frame.shape[:2]
         raw = np.empty((n, 3), dtype=np.float32)
-
         for idx, (y1, y2, x1, x2) in enumerate(self._zones):
-            r1 = max(0, min(h, y1));  r2 = max(r1 + 1, min(h, y2))
-            c1 = max(0, min(w, x1));  c2 = max(c1 + 1, min(w, x2))
+            r1 = max(0, min(h, y1)); r2 = max(r1+1, min(h, y2))
+            c1 = max(0, min(w, x1)); c2 = max(c1+1, min(w, x2))
             region = frame[r1:r2, c1:c2]
-            if region.size > 0:
-                raw[idx] = region.mean(axis=(0, 1))
-            else:
-                raw[idx] = 0.0
+            raw[idx] = region.mean(axis=(0, 1)) if region.size > 0 else 0.0
 
-        # BGR → RGB
         rgb = raw[:, [2, 1, 0]] / 255.0
-
-        # Saturation boost
         max_c = rgb.max(axis=1, keepdims=True)
         rgb = np.clip(max_c - (max_c - rgb) * config.SCREEN_CAPTURE_SATURATION, 0.0, 1.0)
-
-        # Gamma curve
         rgb = np.power(rgb, config.SCREEN_CAPTURE_GAMMA)
-
         return (rgb * 255.0).astype(np.uint8)
 
-    def _send_colors(self, colors_u8: np.ndarray) -> None:
-        """Fire DNRGB UDP packet (non-blocking, fire-and-forget)."""
-        if not self._sock:
-            return
-        body = colors_u8.tobytes()
+    def _send(self, colors_u8: np.ndarray) -> None:
+        if not self._sock: return
         try:
-            self._sock.sendto(self._header + body, (config.WLED_IP, _UDP_PORT))
+            self._sock.sendto(self._header + colors_u8.tobytes(),
+                              (config.WLED_IP, _UDP_PORT))
         except (BlockingIOError, OSError):
             pass
 
-    def _send_keepalive(self) -> None:
-        """Send a keepalive packet to hold WLED in realtime mode."""
-        if not self._sock:
-            return
-        try:
-            self._sock.sendto(self._keepalive_pkt, (config.WLED_IP, _UDP_PORT))
-        except (BlockingIOError, OSError):
-            pass
-
-    # ------------------------------------------------------------------
     def run_loop(self) -> None:
-        """
-        Main capture loop — runs in dedicated thread.
-        Tight native loop with no asyncio overhead.
-        """
         interval = 1.0 / config.SCREEN_CAPTURE_FPS
-        keepalive_interval = _REALTIME_TIMEOUT_SEC / 2.0
-        last_keepalive = 0.0
+        keepalive_every = _REALTIME_TIMEOUT / 2.0
+        last_ka = 0.0
         self._running = True
-
-        log.info("Screen capture thread started @ %d FPS.", config.SCREEN_CAPTURE_FPS)
+        log.info("Python fallback capture loop @ %d FPS.", config.SCREEN_CAPTURE_FPS)
 
         while self._running:
             t0 = time.monotonic()
 
             if state.seg0_source == Seg0Source.SCREEN_CAPTURE:
-                frame = self._capture_frame()
+                frame = self._grab()
                 if frame is not None:
                     state.latest_frame = frame
-                    colors_u8 = self._compute_colors(frame)
-                    state.update_seg0_colors(
-                        [tuple(map(int, row)) for row in colors_u8]
-                    )
-                    self._send_colors(colors_u8)
-                    last_keepalive = t0
-                else:
-                    # No frame yet — send keepalive so WLED doesn't revert
-                    if t0 - last_keepalive >= keepalive_interval:
-                        self._send_keepalive()
-                        last_keepalive = t0
-            else:
-                # Seg 0 owned by another source — send keepalive periodically
-                # so that when ownership returns the strip is still in realtime mode
-                if t0 - last_keepalive >= keepalive_interval:
-                    self._send_keepalive()
-                    last_keepalive = t0
+                    colors_u8 = self._compute(frame)
+                    state.update_seg0_colors([tuple(map(int, r)) for r in colors_u8])
+                    self._send(colors_u8)
+                    last_ka = t0
+                elif t0 - last_ka >= keepalive_every:
+                    self._sock and self._sock.sendto(self._keepalive_pkt,
+                                                     (config.WLED_IP, _UDP_PORT))
+                    last_ka = t0
+            elif t0 - last_ka >= keepalive_every:
+                self._sock and self._sock.sendto(self._keepalive_pkt,
+                                                 (config.WLED_IP, _UDP_PORT))
+                last_ka = t0
 
             elapsed = time.monotonic() - t0
-            sleep = interval - elapsed
-            if sleep > 0.001:
-                time.sleep(sleep)
+            wait = interval - elapsed
+            if wait > 0.001:
+                time.sleep(wait)
 
 
 # ---------------------------------------------------------------------------
-# Async entry point
+# Module entry point
 # ---------------------------------------------------------------------------
 async def run() -> None:
-    engine = ScreenCaptureEngine()
+    binary = _find_binary()
 
+    if binary:
+        log.info("C++ capture engine found: %s", binary)
+        log.info("Using Prismatik-identical DDupl + GPU mip /8 architecture.")
+        ok = await _run_cpp_binary(binary)
+        if ok:
+            return
+        log.warning("C++ binary failed — falling back to Python capture.")
+    else:
+        log.warning("C++ capture binary not found at %s.", _BINARY_NAME)
+        log.warning("For lowest latency, build it:")
+        log.warning("  cd cpp && cmake -B build -G \"Visual Studio 17 2022\" -A x64")
+        log.warning("  cmake --build build --config Release")
+        log.warning("  copy build\\Release\\RoomLightsCapture.exe ..")
+        log.warning("Falling back to Python (dxcam/mss) — expect ~100-200ms latency.")
+
+    # Python fallback
+    engine = PythonCaptureEngine()
     if not await asyncio.to_thread(engine.start):
-        log.error("Screen capture failed to start.")
+        log.error("Python capture fallback also failed.")
         return
 
-    # Launch the tight capture loop in its own thread
-    thread = threading.Thread(target=engine.run_loop, name="screen_capture_loop",
-                              daemon=True)
+    thread = threading.Thread(target=engine.run_loop,
+                              name="py_capture", daemon=True)
     thread.start()
 
-    # Wait for shutdown signal, then stop
     await state.shutdown_event.wait()
     engine.stop()
     thread.join(timeout=2.0)

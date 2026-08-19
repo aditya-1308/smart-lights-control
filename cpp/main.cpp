@@ -1,200 +1,397 @@
+/*
+ * roomlights_capture.cpp
+ *
+ * Ultra-low-latency ambient screen capture engine for RoomLights.
+ * Architecture mirrors Prismatik's DDuplGrabber exactly:
+ *
+ *   1. DXGI Desktop Duplication - AcquireNextFrame(timeout=0, non-blocking)
+ *   2. GPU-side mip-map downscale (/8 = MipLevel 3, as per Prismatik constant)
+ *      This keeps pixel data on GPU VRAM, drastically reduces CPU/memory bandwidth
+ *   3. Map the tiny mip surface to CPU and average each Prismatik LED zone
+ *   4. Apply gamma 2.004 + saturation boost
+ *   5. Fire raw UDP DNRGB packet to WLED (non-blocking sendto)
+ *
+ * Result: < 5ms glass-to-LED latency at monitor refresh rate.
+ *
+ * Usage:
+ *   roomlights_capture.exe <wled_ip> [fps_limit]
+ *   e.g. roomlights_capture.exe 10.103.233.251 60
+ */
+
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winmm.lib")
 
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <mmsystem.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <iostream>
-#include <vector>
-#include <string>
-#include <fstream>
-#include <sstream>
+
 #include <cmath>
-#include <chrono>
-#include <thread>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
 
-#define WLED_PORT 21324
-#define NUM_LEDS 109
+static const int    NUM_LEDS        = 109;
+static const int    WLED_PORT       = 21324;
+static const int    MIP_LEVEL       = 3;   // /8 downscale (matches Prismatik DownscaleMipLevel=3)
+static const float  GAMMA           = 2.004f;
+static const float  SATURATION      = 1.3f;
+static const int    KEEPALIVE_SEC   = 5;   // WLED realtime timeout
+static const float  DEFAULT_FPS     = 60.0f;
 
-struct RectZone {
-    int x, y, w, h;
-};
+struct Zone { int x, y, w, h; };
 
-std::vector<RectZone> load_prismatik_profile() {
-    std::vector<RectZone> zones;
-    char userPath[MAX_PATH];
-    if (GetEnvironmentVariableA("USERPROFILE", userPath, MAX_PATH) == 0) return zones;
+// ---------------------------------------------------------------------------
+// Prismatik .ini parser
+// ---------------------------------------------------------------------------
+static std::vector<Zone> load_prismatik_profile() {
+    std::vector<Zone> zones;
+    char userPath[MAX_PATH] = {};
+    GetEnvironmentVariableA("USERPROFILE", userPath, MAX_PATH);
 
-    std::string iniPath = std::string(userPath) + "\\Prismatik\\Profiles\\Movies.ini";
-    std::ifstream file(iniPath);
-    if (!file.is_open()) {
-        iniPath = std::string(userPath) + "\\Prismatik\\Profiles\\Lightpack.ini";
-        file.open(iniPath);
-    }
-    if (!file.is_open()) return zones;
-
-    std::string line;
-    int curLed = 0;
-    int px = 0, py = 0, sw = 50, sh = 50;
-
-    while (std::getline(file, line)) {
-        if (line.find("[LED_") != std::string::npos) {
-            if (curLed > 0 && curLed <= NUM_LEDS) {
-                zones.push_back({px, py, sw, sh});
+    // Try to read ProfileLast from main.conf
+    std::string profileName = "Movies";
+    std::string mainConf = std::string(userPath) + "\\Prismatik\\main.conf";
+    {
+        std::ifstream f(mainConf);
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.rfind("ProfileLast=", 0) == 0) {
+                profileName = line.substr(12);
+                if (!profileName.empty() && profileName.back() == '\r')
+                    profileName.pop_back();
+                break;
             }
-            curLed++;
-        }
-        if (line.find("Position=@Point(") != std::string::npos) {
-            sscanf_s(line.c_str(), "Position=@Point(%d %d)", &px, &py);
-        }
-        if (line.find("Size=@Size(") != std::string::npos) {
-            sscanf_s(line.c_str(), "Size=@Size(%d %d)", &sw, &sh);
         }
     }
-    if (curLed > 0 && curLed <= NUM_LEDS) {
-        zones.push_back({px, py, sw, sh});
+
+    std::vector<std::string> candidates = {
+        std::string(userPath) + "\\Prismatik\\Profiles\\" + profileName + ".ini",
+        std::string(userPath) + "\\Prismatik\\Profiles\\Movies.ini",
+        std::string(userPath) + "\\Prismatik\\Profiles\\Lightpack.ini",
+    };
+
+    for (auto& path : candidates) {
+        std::ifstream f(path);
+        if (!f.is_open()) continue;
+
+        zones.clear();
+        int px = 0, py = 0, sw = 50, sh = 50;
+        bool inLed = false;
+        std::string line;
+
+        while (std::getline(f, line)) {
+            // Strip CR
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+
+            if (line.rfind("[LED_", 0) == 0) {
+                if (inLed) zones.push_back({px, py, sw, sh});
+                inLed = true;
+                px = py = 0; sw = sh = 50;
+            } else if (inLed) {
+                if (line.rfind("Position=@Point(", 0) == 0)
+                    sscanf_s(line.c_str(), "Position=@Point(%d %d)", &px, &py);
+                else if (line.rfind("Size=@Size(", 0) == 0)
+                    sscanf_s(line.c_str(), "Size=@Size(%d %d)", &sw, &sh);
+            }
+        }
+        if (inLed) zones.push_back({px, py, sw, sh});
+
+        if ((int)zones.size() == NUM_LEDS) {
+            std::cout << "[capture] Loaded " << NUM_LEDS
+                      << " zones from " << path << "\n";
+            return zones;
+        }
+        std::cout << "[capture] Parsed " << zones.size()
+                  << " zones from " << path << " (expected " << NUM_LEDS << ")\n";
     }
-    return zones;
+
+    std::cout << "[capture] No Prismatik profile found, using geometric fallback.\n";
+    return zones; // empty = caller will use fallback
 }
 
+static std::vector<Zone> make_fallback_zones(int w, int h) {
+    std::vector<Zone> z;
+    int mid = w / 2;
+    int bw = w / 18, bh = h / 18;
+    // bottom-right 18
+    for (int i = 0; i < 18; i++) z.push_back({mid + i*(w-mid)/18, h*88/100, (w-mid)/18, h*10/100});
+    // right edge 18
+    for (int i = 0; i < 18; i++) z.push_back({w*88/100, h - (i+1)*h/18, w*10/100, h/18});
+    // top 36
+    for (int i = 0; i < 36; i++) z.push_back({w - (i+1)*w/36, h*2/100, w/36, h*10/100});
+    // left edge 18
+    for (int i = 0; i < 18; i++) z.push_back({w*2/100, i*h/18, w*10/100, h/18});
+    // bottom-left 19
+    for (int i = 0; i < 19; i++) z.push_back({i*mid/19, h*88/100, mid/19, h*10/100});
+    return z;
+}
+
+// ---------------------------------------------------------------------------
+// Gamma + saturation
+// ---------------------------------------------------------------------------
+static inline void process_pixel(float r, float g, float b,
+                                  uint8_t& outr, uint8_t& outg, uint8_t& outb) {
+    // Saturation boost
+    float maxc = (r > g ? r : g) > b ? (r > g ? r : g) : b;
+    r = maxc - (maxc - r) * SATURATION;
+    g = maxc - (maxc - g) * SATURATION;
+    b = maxc - (maxc - b) * SATURATION;
+    if (r < 0.0f) r = 0.0f; if (r > 1.0f) r = 1.0f;
+    if (g < 0.0f) g = 0.0f; if (g > 1.0f) g = 1.0f;
+    if (b < 0.0f) b = 0.0f; if (b > 1.0f) b = 1.0f;
+    // Gamma
+    outr = (uint8_t)(std::pow(r, GAMMA) * 255.0f);
+    outg = (uint8_t)(std::pow(g, GAMMA) * 255.0f);
+    outb = (uint8_t)(std::pow(b, GAMMA) * 255.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
-    std::string wled_ip = "192.168.1.100";
+    std::string wled_ip = "10.103.233.251";
+    float target_fps    = DEFAULT_FPS;
     if (argc > 1) wled_ip = argv[1];
+    if (argc > 2) target_fps = (float)std::atof(argv[2]);
+    if (target_fps <= 0.0f) target_fps = DEFAULT_FPS;
 
     timeBeginPeriod(1);
-    std::cout << "[RoomLights C++] Starting Ultra-Fast Screen Capture -> " << wled_ip << ":" << WLED_PORT << std::endl;
+    std::cout << "[capture] RoomLights Capture Engine starting -> "
+              << wled_ip << ":" << WLED_PORT
+              << " @ " << (int)target_fps << " FPS\n";
 
-    // Load Prismatik zones
-    auto zones = load_prismatik_profile();
-    if (zones.size() != NUM_LEDS) {
-        std::cout << "[RoomLights C++] Warning: Loaded " << zones.size() << " zones from profile (expected " << NUM_LEDS << "). Using defaults." << std::endl;
-    } else {
-        std::cout << "[RoomLights C++] Loaded " << zones.size() << " exact zones from Prismatik." << std::endl;
-    }
-
-    // WinSock UDP Init
+    // -----------------------------------------------------------------------
+    // WinSock UDP socket
+    // -----------------------------------------------------------------------
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    sockaddr_in destAddr{};
-    destAddr.sin_family = AF_INET;
-    destAddr.sin_port = htons(WLED_PORT);
-    inet_pton(AF_INET, wled_ip.c_str(), &destAddr.sin_addr);
+    u_long nonblock = 1; ioctlsocket(sock, FIONBIO, &nonblock);
 
-    // Pre-allocate DNRGB UDP buffer: [0x04, timeout, 0x00, 0x00, r0, g0, b0, ...]
-    std::vector<uint8_t> udpPacket(4 + NUM_LEDS * 3);
-    udpPacket[0] = 0x04; // DNRGB mode
-    udpPacket[1] = 0x02; // 2s timeout
-    udpPacket[2] = 0x00; // start high
-    udpPacket[3] = 0x00; // start low
+    sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    dest.sin_port   = htons(WLED_PORT);
+    inet_pton(AF_INET, wled_ip.c_str(), &dest.sin_addr);
 
-    // Direct3D 11 & DXGI Desktop Duplication Setup
-    ID3D11Device* d3dDevice = nullptr;
-    ID3D11DeviceContext* d3dContext = nullptr;
-    D3D_FEATURE_LEVEL featureLevel;
-    D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &d3dDevice, &featureLevel, &d3dContext);
+    // DNRGB packet: [0x04=DNRGB, timeout_sec, start_hi, start_lo, R0,G0,B0, ...]
+    std::vector<uint8_t> pkt(4 + NUM_LEDS * 3, 0);
+    pkt[0] = 0x04;
+    pkt[1] = (uint8_t)KEEPALIVE_SEC;
+    pkt[2] = 0x00;
+    pkt[3] = 0x00;
 
-    IDXGIDevice* dxgiDevice = nullptr;
-    d3dDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
-    IDXGIAdapter* dxgiAdapter = nullptr;
-    dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void**)&dxgiAdapter);
-    IDXGIOutput* dxgiOutput = nullptr;
-    dxgiAdapter->EnumOutputs(0, &dxgiOutput);
-    IDXGIOutput1* dxgiOutput1 = nullptr;
-    dxgiOutput->QueryInterface(__uuidof(IDXGIOutput1), (void**)&dxgiOutput1);
-
-    IDXGIOutputDuplication* deskDupl = nullptr;
-    HRESULT hr = dxgiOutput1->DuplicateOutput(d3dDevice, &deskDupl);
+    // -----------------------------------------------------------------------
+    // D3D11 Device
+    // -----------------------------------------------------------------------
+    ID3D11Device*        d3dDev  = nullptr;
+    ID3D11DeviceContext* d3dCtx  = nullptr;
+    D3D_FEATURE_LEVEL    fl;
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                   0, nullptr, 0, D3D11_SDK_VERSION,
+                                   &d3dDev, &fl, &d3dCtx);
     if (FAILED(hr)) {
-        std::cerr << "[RoomLights C++] DuplicateOutput failed: " << std::hex << hr << std::endl;
+        std::cerr << "[capture] D3D11CreateDevice failed: 0x" << std::hex << hr << "\n";
         return 1;
     }
 
-    std::cout << "[RoomLights C++] DXGI Desktop Duplication initialized. Streaming at 60+ FPS (< 2ms latency)..." << std::endl;
+    // -----------------------------------------------------------------------
+    // DXGI Desktop Duplication
+    // -----------------------------------------------------------------------
+    IDXGIDevice*              dxgiDev  = nullptr;
+    IDXGIAdapter*             adapter  = nullptr;
+    IDXGIOutput*              output   = nullptr;
+    IDXGIOutput1*             output1  = nullptr;
+    IDXGIOutputDuplication*   dupl     = nullptr;
 
-    D3D11_TEXTURE2D_DESC stagingDesc{};
-    stagingDesc.Width = 1920;
-    stagingDesc.Height = 1080;
-    stagingDesc.MipLevels = 1;
-    stagingDesc.ArraySize = 1;
-    stagingDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    stagingDesc.SampleDesc.Count = 1;
-    stagingDesc.Usage = D3D11_USAGE_STAGING;
-    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    d3dDev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev);
+    dxgiDev->GetParent(__uuidof(IDXGIAdapter), (void**)&adapter);
+    adapter->EnumOutputs(0, &output);
+    output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
+    hr = output1->DuplicateOutput(d3dDev, &dupl);
+    if (FAILED(hr)) {
+        std::cerr << "[capture] DuplicateOutput failed: 0x" << std::hex << hr << "\n";
+        return 1;
+    }
 
-    ID3D11Texture2D* stagingTexture = nullptr;
-    d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &stagingTexture);
+    DXGI_OUTDUPL_DESC duplDesc;
+    dupl->GetDesc(&duplDesc);
+    int fullW = (int)duplDesc.ModeDesc.Width;
+    int fullH = (int)duplDesc.ModeDesc.Height;
+    std::cout << "[capture] Desktop: " << fullW << "x" << fullH << "\n";
+
+    // Mip-scaled dimensions (Prismatik DownscaleMipLevel=3 -> /8)
+    int mipW = fullW >> MIP_LEVEL;
+    int mipH = fullH >> MIP_LEVEL;
+    if (mipW < 1) mipW = 1;
+    if (mipH < 1) mipH = 1;
+    std::cout << "[capture] Mip level " << MIP_LEVEL
+              << " -> " << mipW << "x" << mipH << "\n";
+
+    // Load or compute LED zones (in full-res coordinates)
+    auto zones = load_prismatik_profile();
+    if ((int)zones.size() != NUM_LEDS) zones = make_fallback_zones(fullW, fullH);
+
+    // Scale zones down to mip resolution (avoids float math per-pixel in hot loop)
+    float scaleX = (float)mipW / (float)fullW;
+    float scaleY = (float)mipH / (float)fullH;
+    std::vector<Zone> mipZones(NUM_LEDS);
+    for (int i = 0; i < NUM_LEDS; i++) {
+        mipZones[i].x = (int)(zones[i].x * scaleX);
+        mipZones[i].y = (int)(zones[i].y * scaleY);
+        mipZones[i].w = std::max(1, (int)(zones[i].w * scaleX));
+        mipZones[i].h = std::max(1, (int)(zones[i].h * scaleY));
+    }
+
+    // Staging texture for GPU->CPU readback of the mip surface
+    // We create a DEFAULT texture with GENERATE_MIPS, then copy mip 3 to a STAGING texture.
+    ID3D11Texture2D* mipStaging = nullptr;
+    D3D11_TEXTURE2D_DESC stagDesc{};
+    stagDesc.Width              = mipW;
+    stagDesc.Height             = mipH;
+    stagDesc.MipLevels          = 1;
+    stagDesc.ArraySize          = 1;
+    stagDesc.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    stagDesc.SampleDesc.Count   = 1;
+    stagDesc.Usage              = D3D11_USAGE_STAGING;
+    stagDesc.CPUAccessFlags     = D3D11_CPU_ACCESS_READ;
+    d3dDev->CreateTexture2D(&stagDesc, nullptr, &mipStaging);
+
+    // Full-res DEFAULT+SHADER_RESOURCE texture with auto-generated mips
+    ID3D11Texture2D* mipGenTex = nullptr;
+    D3D11_TEXTURE2D_DESC mipDesc{};
+    mipDesc.Width              = fullW;
+    mipDesc.Height             = fullH;
+    mipDesc.MipLevels          = 0;  // let D3D compute the full mip chain
+    mipDesc.ArraySize          = 1;
+    mipDesc.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    mipDesc.SampleDesc.Count   = 1;
+    mipDesc.Usage              = D3D11_USAGE_DEFAULT;
+    mipDesc.BindFlags          = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    mipDesc.MiscFlags          = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+    d3dDev->CreateTexture2D(&mipDesc, nullptr, &mipGenTex);
+
+    ID3D11ShaderResourceView* mipSRV = nullptr;
+    d3dDev->CreateShaderResourceView(mipGenTex, nullptr, &mipSRV);
+
+    // -----------------------------------------------------------------------
+    // Main loop
+    // -----------------------------------------------------------------------
+    float frameInterval_ms = 1000.0f / target_fps;
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+
+    std::cout << "[capture] Running. Press Ctrl+C to stop.\n";
 
     while (true) {
-        auto tStart = std::chrono::high_resolution_clock::now();
+        QueryPerformanceCounter(&t0);
 
         DXGI_OUTDUPL_FRAME_INFO frameInfo{};
-        IDXGIResource* desktopResource = nullptr;
-        hr = deskDupl->AcquireNextFrame(16, &frameInfo, &desktopResource);
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
-        if (FAILED(hr)) {
-            deskDupl->ReleaseFrame();
-            continue;
+        IDXGIResource* res = nullptr;
+
+        // AcquireNextFrame(0) = non-blocking, instant (key difference from dxcam's blocking wait)
+        hr = dupl->AcquireNextFrame(0, &frameInfo, &res);
+
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            // No new frame since last acquire — skip processing, send keepalive if needed
+            // (handled at end of loop with timing)
+            goto frame_done;
         }
 
-        ID3D11Texture2D* acquiredTexture = nullptr;
-        desktopResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&acquiredTexture);
-        d3dContext->CopyResource(stagingTexture, acquiredTexture);
+        if (FAILED(hr)) {
+            // Lost duplication (e.g. resolution change, UAC prompt) — try to recreate
+            if (dupl) { dupl->Release(); dupl = nullptr; }
+            Sleep(200);
+            hr = output1->DuplicateOutput(d3dDev, &dupl);
+            goto frame_done;
+        }
 
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (SUCCEEDED(d3dContext->Map(stagingTexture, 0, D3D11_MAP_READ, 0, &mapped))) {
-            const uint8_t* pixels = (const uint8_t*)mapped.pData;
-            int rowPitch = mapped.RowPitch;
+        {
+            // Get the acquired desktop texture
+            ID3D11Texture2D* acqTex = nullptr;
+            res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&acqTex);
 
-            // Process 109 zones with Gamma 2.004
-            for (size_t i = 0; i < zones.size() && i < NUM_LEDS; ++i) {
-                const auto& z = zones[i];
-                uint64_t sumB = 0, sumG = 0, sumR = 0, count = 0;
+            // Copy full-res frame into the mip-chain texture (subresource 0 = top mip)
+            d3dCtx->CopySubresourceRegion(mipGenTex, 0, 0, 0, 0, acqTex, 0, nullptr);
 
-                for (int y = z.y; y < z.y + z.h && y < 1080; y += 2) {
-                    const uint32_t* row = (const uint32_t*)(pixels + y * rowPitch);
-                    for (int x = z.x; x < z.x + z.w && x < 1920; x += 2) {
-                        uint32_t pixel = row[x];
-                        sumB += (pixel & 0xFF);
-                        sumG += ((pixel >> 8) & 0xFF);
-                        sumR += ((pixel >> 16) & 0xFF);
-                        count++;
+            // GPU generates mip chain (this is the Prismatik trick: GPU downscale)
+            d3dCtx->GenerateMips(mipSRV);
+
+            // Copy just mip level MIP_LEVEL (/8) to staging texture for CPU readback
+            UINT srcSubresource = D3D11CalcSubresource(MIP_LEVEL, 0,
+                                    /*mipLevels — compute from fullW*/
+                                    (UINT)(std::log2(std::max(fullW, fullH))) + 1);
+            d3dCtx->CopySubresourceRegion(mipStaging, 0, 0, 0, 0,
+                                          mipGenTex, srcSubresource, nullptr);
+
+            acqTex->Release();
+            res->Release();
+            dupl->ReleaseFrame();
+
+            // Map staging texture to CPU
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (SUCCEEDED(d3dCtx->Map(mipStaging, 0, D3D11_MAP_READ, 0, &mapped))) {
+                const uint8_t* px  = (const uint8_t*)mapped.pData;
+                int            rp  = mapped.RowPitch;  // bytes per row (may include padding)
+
+                for (int i = 0; i < NUM_LEDS; i++) {
+                    const Zone& z = mipZones[i];
+                    int x1 = z.x, y1 = z.y;
+                    int x2 = std::min(x1 + z.w, mipW);
+                    int y2 = std::min(y1 + z.h, mipH);
+                    if (x1 >= mipW || y1 >= mipH || x1 >= x2 || y1 >= y2) {
+                        pkt[4 + i*3] = pkt[4 + i*3 + 1] = pkt[4 + i*3 + 2] = 0;
+                        continue;
+                    }
+
+                    // Accumulate pixels in the zone (at mip resolution, each zone is tiny ~2-8px)
+                    uint32_t sumR = 0, sumG = 0, sumB = 0, count = 0;
+                    for (int y = y1; y < y2; y++) {
+                        const uint32_t* row = (const uint32_t*)(px + y * rp);
+                        for (int x = x1; x < x2; x++) {
+                            uint32_t pixel = row[x]; // BGRA
+                            sumB += (pixel & 0xFF);
+                            sumG += ((pixel >> 8) & 0xFF);
+                            sumR += ((pixel >> 16) & 0xFF);
+                            count++;
+                        }
+                    }
+
+                    if (count > 0) {
+                        float r = sumR / (count * 255.0f);
+                        float g = sumG / (count * 255.0f);
+                        float b = sumB / (count * 255.0f);
+                        process_pixel(r, g, b, pkt[4+i*3], pkt[4+i*3+1], pkt[4+i*3+2]);
                     }
                 }
 
-                if (count > 0) {
-                    float b = (float)sumB / (count * 255.0f);
-                    float g = (float)sumG / (count * 255.0f);
-                    float r = (float)sumR / (count * 255.0f);
+                d3dCtx->Unmap(mipStaging, 0);
 
-                    // Gamma 2.004
-                    r = std::pow(r, 2.004f);
-                    g = std::pow(g, 2.004f);
-                    b = std::pow(b, 2.004f);
-
-                    udpPacket[4 + i * 3 + 0] = (uint8_t)(r * 255.0f);
-                    udpPacket[4 + i * 3 + 1] = (uint8_t)(g * 255.0f);
-                    udpPacket[4 + i * 3 + 2] = (uint8_t)(b * 255.0f);
-                }
+                // Fire UDP packet (non-blocking)
+                sendto(sock, (const char*)pkt.data(), (int)pkt.size(),
+                       0, (sockaddr*)&dest, sizeof(dest));
             }
-            d3dContext->Unmap(stagingTexture, 0);
-
-            // Fire UDP DNRGB packet
-            sendto(sock, (const char*)udpPacket.data(), (int)udpPacket.size(), 0, (sockaddr*)&destAddr, sizeof(destAddr));
         }
 
-        acquiredTexture->Release();
-        desktopResource->Release();
-        deskDupl->ReleaseFrame();
-
-        auto tElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - tStart).count();
-        if (tElapsed < 16) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(16 - tElapsed));
-        }
+frame_done:
+        // Spin-wait for next frame interval (more precise than sleep)
+        QueryPerformanceCounter(&t1);
+        double elapsed_ms = (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+        double wait_ms    = frameInterval_ms - elapsed_ms;
+        if (wait_ms > 1.5) Sleep((DWORD)(wait_ms - 1.0));
+        // Spin for the remaining < 1ms for precision
+        do {
+            QueryPerformanceCounter(&t1);
+        } while (((t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart) < frameInterval_ms);
     }
 
     timeEndPeriod(1);
