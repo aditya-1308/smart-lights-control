@@ -174,6 +174,13 @@ async def main() -> None:
         # Wait for all tasks to finish cancellation
         await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Restore WLED default presets / effects across the entire strip
+        try:
+            log.info("Restoring WLED default state across all segments...")
+            await wled.restore_default_state()
+        except Exception as exc:
+            log.debug("Error restoring WLED default state: %s", exc)
+
     log.info("RoomLights stopped. Goodbye.")
 
 

@@ -105,7 +105,11 @@ class LightbarRenderer:
             if sleep_for > 0:
                 await asyncio.sleep(sleep_for)
 
-        await self._wled.set_lightbar_off()
+        try:
+            from ipc_bridge import ipc_bridge
+            ipc_bridge.clear()
+        except Exception:
+            pass
         log.info("Lightbar renderer stopped.")
 
     async def _render_frame(self) -> None:
