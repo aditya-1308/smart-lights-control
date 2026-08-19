@@ -146,7 +146,7 @@ class LightbarRenderer:
         else:  # IDLE
             color_array = [_OFF] * config.LIGHTBAR_TOTAL
 
-        # Send to C++ IPC bridge and WLED
+        # Send to C++ IPC bridge (which streams to WLED via 60 FPS UDP)
         if color_array != self._last_sent_colors:
             self._last_sent_colors = list(color_array)
             state.update_lightbar_colors(color_array)
@@ -158,7 +158,6 @@ class LightbarRenderer:
                     ipc_bridge.clear()
             except Exception:
                 pass
-            await self._wled.set_lightbar(color_array)
 
         await self._update_mode()
 
