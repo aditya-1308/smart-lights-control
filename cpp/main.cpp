@@ -5,15 +5,11 @@
  * Optimized based on Prismatik's native architecture:
  *
  *   1. Direct DXGI Desktop Duplication - AcquireNextFrame(timeout=0)
- *   2. Direct GPU->CPU staging copy without GenerateMips pipeline flush
- *   3. Prismatik 4-pixel strided zone accumulation (4x speed boost)
- *   4. Zero-spin CPU pacing (Sleep on DXGI wait timeout)
- *   5. Flexible profile & segment targeting (any Prismatik profile -> any strip segment)
- *
- * Usage:
- *   roomlights_capture.exe <wled_ip> [fps] [start_led] [profile_name_or_path]
- *   e.g. roomlights_capture.exe 10.103.233.251 60 17 Movies.ini
- *   e.g. roomlights_capture.exe 10.103.233.251 60 0  Gaming.ini
+ *   2. Automatic DXGI retry loop on 0x80070005 (Access Denied / Multi-app lock)
+ *   3. Caps LED zone count to 109 to match physical Segment 0 (331-byte MTU-safe UDP packet)
+ *   4. Direct GPU->CPU staging copy without GenerateMips pipeline flush
+ *   5. Prismatik 4-pixel strided accumulation (4x speed boost)
+ *   6. Real-time event & UDP transmission log file: d:\RoomLights\roomlights_capture.log
  */
 
 #pragma comment(lib, "d3d11.lib")
@@ -38,6 +34,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 using std::min;
 using std::max;
@@ -48,8 +45,29 @@ static const float  SATURATION      = 1.2f;   // Vibrant saturation boost
 static const int    KEEPALIVE_SEC   = 5;      // WLED realtime timeout
 static const float  DEFAULT_FPS     = 60.0f;
 static const int    PIXELS_PER_STEP = 4;      // Prismatik 4-pixel strided sampling
+static const int    DEFAULT_SEG0_LEDS = 109;  // Physical Segment 0 LED count
 
 struct Zone { int x, y, w, h; };
+
+// File logger
+static std::ofstream g_logFile;
+
+static void log_msg(const std::string& msg) {
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    struct tm tm_buf;
+    localtime_s(&tm_buf, &time_t_now);
+
+    char time_str[32];
+    std::strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
+
+    std::string formatted = "[" + std::string(time_str) + "] [capture] " + msg + "\n";
+    std::cout << formatted << std::flush;
+
+    if (g_logFile.is_open()) {
+        g_logFile << formatted << std::flush;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Native 109-LED zone fallback layout from Prismatik Movies.ini profile
@@ -88,7 +106,7 @@ static const Zone MOVIES_PROFILE_ZONES[109] = {
 // ---------------------------------------------------------------------------
 // Prismatik .ini parser (supports any profile name or full path)
 // ---------------------------------------------------------------------------
-static std::vector<Zone> load_prismatik_profile(const std::string& requestedProfile) {
+static std::vector<Zone> load_prismatik_profile(const std::string& requestedProfile, int max_allowed_leds) {
     std::vector<Zone> zones;
     char userPath[MAX_PATH] = {};
     GetEnvironmentVariableA("USERPROFILE", userPath, MAX_PATH);
@@ -134,14 +152,19 @@ static std::vector<Zone> load_prismatik_profile(const std::string& requestedProf
         if (inLed) zones.push_back({px, py, sw, sh});
 
         if (!zones.empty()) {
-            std::cout << "[capture] Loaded " << zones.size()
-                      << " LED zones from " << path << "\n";
+            if ((int)zones.size() > max_allowed_leds) {
+                log_msg("Parsed " + std::to_string(zones.size()) + " zones from " + path +
+                        ", capping to active Segment 0 count (" + std::to_string(max_allowed_leds) + ").");
+                zones.resize(max_allowed_leds);
+            } else {
+                log_msg("Loaded " + std::to_string(zones.size()) + " LED zones from " + path);
+            }
             return zones;
         }
     }
 
-    std::cout << "[capture] Using embedded Movies.ini 109-zone profile fallback.\n";
-    return std::vector<Zone>(MOVIES_PROFILE_ZONES, MOVIES_PROFILE_ZONES + 109);
+    log_msg("Using embedded Movies.ini 109-zone profile fallback.");
+    return std::vector<Zone>(MOVIES_PROFILE_ZONES, MOVIES_PROFILE_ZONES + DEFAULT_SEG0_LEDS);
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +188,8 @@ static inline void process_pixel(float r, float g, float b,
 // Main
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
+    g_logFile.open("roomlights_capture.log", std::ios::out | std::ios::app);
+
     std::string wled_ip     = "10.103.233.251";
     float target_fps        = DEFAULT_FPS;
     int start_led_offset    = 17;        // Default: Seg 0 starts at LED 17
@@ -179,10 +204,10 @@ int main(int argc, char* argv[]) {
     if (start_led_offset < 0) start_led_offset = 0;
 
     timeBeginPeriod(1);
-    std::cout << "[capture] RoomLights Native Capture Engine\n"
-              << "[capture] Target: " << wled_ip << ":" << WLED_PORT << "\n"
-              << "[capture] Segment Start LED Offset: " << start_led_offset << "\n"
-              << "[capture] Rate: " << (int)target_fps << " FPS\n";
+    log_msg("=== RoomLights Native Capture Engine Started ===");
+    log_msg("Target WLED: " + wled_ip + ":" + std::to_string(WLED_PORT));
+    log_msg("Segment Start LED Offset: " + std::to_string(start_led_offset));
+    log_msg("Target Rate: " + std::to_string((int)target_fps) + " FPS");
 
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -194,11 +219,10 @@ int main(int argc, char* argv[]) {
     dest.sin_port   = htons(WLED_PORT);
     inet_pton(AF_INET, wled_ip.c_str(), &dest.sin_addr);
 
-    // Load requested Prismatik profile
-    auto zones = load_prismatik_profile(profile_req);
+    // Load requested Prismatik profile (capped to 109 LEDs for physical Segment 0)
+    auto zones = load_prismatik_profile(profile_req, DEFAULT_SEG0_LEDS);
     int num_leds = (int)zones.size();
 
-    // Prepare WLED UDP DNRGB Packet Header
     // Header: [0x04=DNRGB, timeout_sec, start_hi, start_lo, R0, G0, B0, ...]
     std::vector<uint8_t> pkt(4 + num_leds * 3, 0);
     pkt[0] = 0x04;
@@ -213,7 +237,7 @@ int main(int argc, char* argv[]) {
                                    0, nullptr, 0, D3D11_SDK_VERSION,
                                    &d3dDev, &fl, &d3dCtx);
     if (FAILED(hr)) {
-        std::cerr << "[capture] D3D11CreateDevice failed: 0x" << std::hex << hr << "\n";
+        log_msg("CRITICAL: D3D11CreateDevice failed: 0x" + std::to_string(hr));
         return 1;
     }
 
@@ -227,19 +251,25 @@ int main(int argc, char* argv[]) {
     dxgiDev->GetParent(__uuidof(IDXGIAdapter), (void**)&adapter);
     adapter->EnumOutputs(0, &output);
     output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
-    hr = output1->DuplicateOutput(d3dDev, &dupl);
-    if (FAILED(hr)) {
-        std::cerr << "[capture] DuplicateOutput failed: 0x" << std::hex << hr << "\n";
-        return 1;
+
+    // Automatic retry loop for DXGI Desktop Duplication (handles 0x80070005 Access Denied when another app locks DXGI)
+    int retry_count = 0;
+    while (FAILED(hr = output1->DuplicateOutput(d3dDev, &dupl))) {
+        retry_count++;
+        char hex_buf[32];
+        sprintf_s(hex_buf, "0x%08X", (unsigned int)hr);
+        log_msg("DuplicateOutput attempt #" + std::to_string(retry_count) +
+                " failed (" + std::string(hex_buf) + "). Waiting for DXGI access...");
+        Sleep(1000);
     }
+    log_msg("DXGI Desktop Duplication successfully attached!");
 
     DXGI_OUTDUPL_DESC duplDesc;
     dupl->GetDesc(&duplDesc);
     int fullW = (int)duplDesc.ModeDesc.Width;
     int fullH = (int)duplDesc.ModeDesc.Height;
-    std::cout << "[capture] Display Resolution: " << fullW << "x" << fullH << "\n";
+    log_msg("Display Resolution: " + std::to_string(fullW) + "x" + std::to_string(fullH));
 
-    // Direct Staging Texture for GPU->CPU readback without GenerateMips stall
     ID3D11Texture2D* stagingTex = nullptr;
     D3D11_TEXTURE2D_DESC stagDesc{};
     stagDesc.Width              = fullW;
@@ -256,8 +286,12 @@ int main(int argc, char* argv[]) {
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
 
-    std::cout << "[capture] Native ambient capture active (" << num_leds
-              << " LEDs -> Segment Start " << start_led_offset << ").\n";
+    log_msg("UDP Streaming Loop Active (" + std::to_string(num_leds) + " LEDs, " +
+            std::to_string(pkt.size()) + " byte DNRGB packets -> offset " +
+            std::to_string(start_led_offset) + ").");
+
+    uint64_t total_packets = 0;
+    auto last_stat_log = std::chrono::steady_clock::now();
 
     while (true) {
         QueryPerformanceCounter(&t0);
@@ -268,7 +302,6 @@ int main(int argc, char* argv[]) {
         hr = dupl->AcquireNextFrame(0, &frameInfo, &res);
 
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            // Zero-spin: sleep 1ms when no new desktop frame arrives
             Sleep(1);
             goto frame_done;
         }
@@ -284,7 +317,6 @@ int main(int argc, char* argv[]) {
             ID3D11Texture2D* acqTex = nullptr;
             res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&acqTex);
 
-            // Direct CopyResource from Acquired GPU Texture to CPU Staging Texture
             d3dCtx->CopyResource(stagingTex, acqTex);
 
             acqTex->Release();
@@ -296,7 +328,6 @@ int main(int argc, char* argv[]) {
                 const uint8_t* px = (const uint8_t*)mapped.pData;
                 int rp            = mapped.RowPitch;
 
-                // Prismatik 4-pixel strided accumulation algorithm (calculations.cpp)
                 for (int i = 0; i < num_leds; i++) {
                     const Zone& z = zones[i];
                     int x1 = max(0, min(fullW - 1, z.x));
@@ -328,8 +359,20 @@ int main(int argc, char* argv[]) {
                 d3dCtx->Unmap(stagingTex, 0);
 
                 // Send non-blocking UDP DNRGB frame
-                sendto(sock, (const char*)pkt.data(), (int)pkt.size(),
-                       0, (sockaddr*)&dest, sizeof(dest));
+                int bytesSent = sendto(sock, (const char*)pkt.data(), (int)pkt.size(),
+                                       0, (sockaddr*)&dest, sizeof(dest));
+                if (bytesSent > 0) {
+                    total_packets++;
+                }
+
+                // Log UDP transmission statistics every 5 seconds
+                auto now_stat = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now_stat - last_stat_log).count() >= 5) {
+                    last_stat_log = now_stat;
+                    log_msg("UDP Stats: Sent " + std::to_string(total_packets) +
+                            " total packets. Last LED[0] RGB=(" +
+                            std::to_string(pkt[4]) + "," + std::to_string(pkt[5]) + "," + std::to_string(pkt[6]) + ")");
+                }
             }
         }
 
