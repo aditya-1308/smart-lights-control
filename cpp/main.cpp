@@ -2,20 +2,7 @@
  * roomlights_capture.cpp
  *
  * Ultra-low-latency ambient screen capture engine for RoomLights.
- * Architecture mirrors Prismatik's DDuplGrabber exactly:
- *
- *   1. DXGI Desktop Duplication - AcquireNextFrame(timeout=0, non-blocking)
- *   2. GPU-side mip-map downscale (/8 = MipLevel 3, as per Prismatik constant)
- *      This keeps pixel data on GPU VRAM, drastically reduces CPU/memory bandwidth
- *   3. Map the tiny mip surface to CPU and average each Prismatik LED zone
- *   4. Apply gamma 2.004 + saturation boost
- *   5. Fire raw UDP DNRGB packet to WLED (non-blocking sendto)
- *
- * Result: < 5ms glass-to-LED latency at monitor refresh rate.
- *
- * Usage:
- *   roomlights_capture.exe <wled_ip> [fps_limit]
- *   e.g. roomlights_capture.exe 10.103.233.251 60
+ * Embedded with exact 109-zone Prismatik Movies.ini calibration.
  */
 
 #pragma comment(lib, "d3d11.lib")
@@ -43,12 +30,127 @@
 static const int    NUM_LEDS        = 109;
 static const int    WLED_PORT       = 21324;
 static const int    MIP_LEVEL       = 3;   // /8 downscale (matches Prismatik DownscaleMipLevel=3)
-static const float  GAMMA           = 2.004f;
+static const float  GAMMA           = 2.004f; // Hardware gamma from Movies.ini
 static const float  SATURATION      = 1.3f;
 static const int    KEEPALIVE_SEC   = 5;   // WLED realtime timeout
 static const float  DEFAULT_FPS     = 60.0f;
 
 struct Zone { int x, y, w, h; };
+
+// ---------------------------------------------------------------------------
+// Native 109-LED zone layout extracted from Prismatik Movies.ini profile
+// ---------------------------------------------------------------------------
+static const Zone MOVIES_PROFILE_ZONES[109] = {
+    {986, 813, 52, 116},
+    {1038, 813, 52, 116},
+    {1090, 813, 52, 116},
+    {1142, 813, 52, 116},
+    {1194, 813, 52, 116},
+    {1246, 813, 52, 116},
+    {1298, 813, 52, 116},
+    {1350, 813, 52, 116},
+    {1402, 813, 52, 116},
+    {1454, 813, 52, 116},
+    {1506, 813, 52, 116},
+    {1558, 813, 52, 116},
+    {1610, 813, 52, 116},
+    {1662, 813, 52, 116},
+    {1714, 813, 52, 116},
+    {1766, 813, 52, 116},
+    {1818, 813, 51, 116},
+    {1869, 813, 51, 116},
+    {1632, 886, 288, 43},
+    {1632, 843, 288, 43},
+    {1632, 800, 288, 43},
+    {1632, 757, 288, 43},
+    {1632, 714, 288, 43},
+    {1632, 671, 288, 43},
+    {1632, 628, 288, 43},
+    {1632, 585, 288, 43},
+    {1632, 542, 288, 43},
+    {1632, 499, 288, 43},
+    {1632, 456, 288, 43},
+    {1632, 412, 288, 44},
+    {1632, 368, 288, 44},
+    {1632, 324, 288, 44},
+    {1632, 280, 288, 44},
+    {1632, 237, 288, 43},
+    {1632, 194, 288, 43},
+    {1632, 151, 288, 43},
+    {1867, 151, 53, 116},
+    {1814, 151, 53, 116},
+    {1761, 151, 53, 116},
+    {1708, 151, 53, 116},
+    {1655, 151, 53, 116},
+    {1602, 151, 53, 116},
+    {1549, 151, 53, 116},
+    {1496, 151, 53, 116},
+    {1443, 151, 53, 116},
+    {1390, 151, 53, 116},
+    {1337, 151, 53, 116},
+    {1284, 151, 53, 116},
+    {1230, 151, 54, 116},
+    {1177, 151, 53, 116},
+    {1124, 151, 53, 116},
+    {1071, 151, 53, 116},
+    {1018, 151, 53, 116},
+    {965, 151, 53, 116},
+    {912, 151, 53, 116},
+    {859, 151, 53, 116},
+    {806, 151, 53, 116},
+    {753, 151, 53, 116},
+    {700, 151, 53, 116},
+    {647, 151, 53, 116},
+    {594, 151, 53, 116},
+    {541, 151, 53, 116},
+    {488, 151, 53, 116},
+    {435, 151, 53, 116},
+    {382, 151, 53, 116},
+    {329, 151, 53, 116},
+    {276, 151, 53, 116},
+    {223, 151, 53, 116},
+    {170, 151, 53, 116},
+    {117, 151, 53, 116},
+    {64, 151, 53, 116},
+    {0, 151, 64, 116},
+    {0, 151, 288, 43},
+    {0, 194, 288, 43},
+    {0, 237, 288, 43},
+    {0, 280, 288, 44},
+    {0, 324, 288, 44},
+    {0, 368, 288, 44},
+    {0, 412, 288, 44},
+    {0, 456, 288, 43},
+    {0, 499, 288, 43},
+    {0, 542, 288, 43},
+    {0, 585, 288, 43},
+    {0, 628, 288, 43},
+    {0, 671, 288, 43},
+    {0, 714, 288, 43},
+    {0, 757, 288, 43},
+    {0, 800, 288, 43},
+    {0, 843, 288, 43},
+    {0, 886, 288, 43},
+    {0, 813, 52, 116},
+    {52, 813, 52, 116},
+    {104, 813, 52, 116},
+    {156, 813, 52, 116},
+    {208, 813, 52, 116},
+    {260, 813, 52, 116},
+    {312, 813, 52, 116},
+    {364, 813, 52, 116},
+    {416, 813, 52, 116},
+    {468, 813, 52, 116},
+    {520, 813, 52, 116},
+    {572, 813, 52, 116},
+    {624, 813, 52, 116},
+    {676, 813, 52, 116},
+    {728, 813, 52, 116},
+    {780, 813, 52, 116},
+    {832, 813, 52, 116},
+    {884, 813, 51, 116},
+    {935, 813, 51, 116}
+};
 
 // ---------------------------------------------------------------------------
 // Prismatik .ini parser
@@ -58,7 +160,6 @@ static std::vector<Zone> load_prismatik_profile() {
     char userPath[MAX_PATH] = {};
     GetEnvironmentVariableA("USERPROFILE", userPath, MAX_PATH);
 
-    // Try to read ProfileLast from main.conf
     std::string profileName = "Movies";
     std::string mainConf = std::string(userPath) + "\\Prismatik\\main.conf";
     {
@@ -90,7 +191,6 @@ static std::vector<Zone> load_prismatik_profile() {
         std::string line;
 
         while (std::getline(f, line)) {
-            // Strip CR
             if (!line.empty() && line.back() == '\r') line.pop_back();
 
             if (line.rfind("[LED_", 0) == 0) {
@@ -107,41 +207,21 @@ static std::vector<Zone> load_prismatik_profile() {
         if (inLed) zones.push_back({px, py, sw, sh});
 
         if ((int)zones.size() == NUM_LEDS) {
-            std::cout << "[capture] Loaded " << NUM_LEDS
-                      << " zones from " << path << "\n";
+            std::cout << "[capture] Successfully loaded " << NUM_LEDS
+                      << " exact zones from " << path << "\n";
             return zones;
         }
-        std::cout << "[capture] Parsed " << zones.size()
-                  << " zones from " << path << " (expected " << NUM_LEDS << ")\n";
     }
 
-    std::cout << "[capture] No Prismatik profile found, using geometric fallback.\n";
-    return zones; // empty = caller will use fallback
-}
-
-static std::vector<Zone> make_fallback_zones(int w, int h) {
-    std::vector<Zone> z;
-    int mid = w / 2;
-    int bw = w / 18, bh = h / 18;
-    // bottom-right 18
-    for (int i = 0; i < 18; i++) z.push_back({mid + i*(w-mid)/18, h*88/100, (w-mid)/18, h*10/100});
-    // right edge 18
-    for (int i = 0; i < 18; i++) z.push_back({w*88/100, h - (i+1)*h/18, w*10/100, h/18});
-    // top 36
-    for (int i = 0; i < 36; i++) z.push_back({w - (i+1)*w/36, h*2/100, w/36, h*10/100});
-    // left edge 18
-    for (int i = 0; i < 18; i++) z.push_back({w*2/100, i*h/18, w*10/100, h/18});
-    // bottom-left 19
-    for (int i = 0; i < 19; i++) z.push_back({i*mid/19, h*88/100, mid/19, h*10/100});
-    return z;
+    std::cout << "[capture] Loaded native Movies.ini 109-zone calibration profile.\n";
+    return std::vector<Zone>(MOVIES_PROFILE_ZONES, MOVIES_PROFILE_ZONES + NUM_LEDS);
 }
 
 // ---------------------------------------------------------------------------
-// Gamma + saturation
+// Gamma + saturation processing
 // ---------------------------------------------------------------------------
 static inline void process_pixel(float r, float g, float b,
                                   uint8_t& outr, uint8_t& outg, uint8_t& outb) {
-    // Saturation boost
     float maxc = (r > g ? r : g) > b ? (r > g ? r : g) : b;
     r = maxc - (maxc - r) * SATURATION;
     g = maxc - (maxc - g) * SATURATION;
@@ -149,7 +229,6 @@ static inline void process_pixel(float r, float g, float b,
     if (r < 0.0f) r = 0.0f; if (r > 1.0f) r = 1.0f;
     if (g < 0.0f) g = 0.0f; if (g > 1.0f) g = 1.0f;
     if (b < 0.0f) b = 0.0f; if (b > 1.0f) b = 1.0f;
-    // Gamma
     outr = (uint8_t)(std::pow(r, GAMMA) * 255.0f);
     outg = (uint8_t)(std::pow(g, GAMMA) * 255.0f);
     outb = (uint8_t)(std::pow(b, GAMMA) * 255.0f);
@@ -166,13 +245,10 @@ int main(int argc, char* argv[]) {
     if (target_fps <= 0.0f) target_fps = DEFAULT_FPS;
 
     timeBeginPeriod(1);
-    std::cout << "[capture] RoomLights Capture Engine starting -> "
+    std::cout << "[capture] RoomLights Capture Engine (Prismatik Movies.ini calibrated) -> "
               << wled_ip << ":" << WLED_PORT
               << " @ " << (int)target_fps << " FPS\n";
 
-    // -----------------------------------------------------------------------
-    // WinSock UDP socket
-    // -----------------------------------------------------------------------
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -191,9 +267,6 @@ int main(int argc, char* argv[]) {
     pkt[2] = 0x00;
     pkt[3] = 17; // LED 17 start offset
 
-    // -----------------------------------------------------------------------
-    // D3D11 Device
-    // -----------------------------------------------------------------------
     ID3D11Device*        d3dDev  = nullptr;
     ID3D11DeviceContext* d3dCtx  = nullptr;
     D3D_FEATURE_LEVEL    fl;
@@ -205,9 +278,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // -----------------------------------------------------------------------
-    // DXGI Desktop Duplication
-    // -----------------------------------------------------------------------
     IDXGIDevice*              dxgiDev  = nullptr;
     IDXGIAdapter*             adapter  = nullptr;
     IDXGIOutput*              output   = nullptr;
@@ -228,21 +298,15 @@ int main(int argc, char* argv[]) {
     dupl->GetDesc(&duplDesc);
     int fullW = (int)duplDesc.ModeDesc.Width;
     int fullH = (int)duplDesc.ModeDesc.Height;
-    std::cout << "[capture] Desktop: " << fullW << "x" << fullH << "\n";
+    std::cout << "[capture] Desktop resolution: " << fullW << "x" << fullH << "\n";
 
-    // Mip-scaled dimensions (Prismatik DownscaleMipLevel=3 -> /8)
     int mipW = fullW >> MIP_LEVEL;
     int mipH = fullH >> MIP_LEVEL;
     if (mipW < 1) mipW = 1;
     if (mipH < 1) mipH = 1;
-    std::cout << "[capture] Mip level " << MIP_LEVEL
-              << " -> " << mipW << "x" << mipH << "\n";
 
-    // Load or compute LED zones (in full-res coordinates)
     auto zones = load_prismatik_profile();
-    if ((int)zones.size() != NUM_LEDS) zones = make_fallback_zones(fullW, fullH);
 
-    // Scale zones down to mip resolution (avoids float math per-pixel in hot loop)
     float scaleX = (float)mipW / (float)fullW;
     float scaleY = (float)mipH / (float)fullH;
     std::vector<Zone> mipZones(NUM_LEDS);
@@ -253,8 +317,6 @@ int main(int argc, char* argv[]) {
         mipZones[i].h = std::max(1, (int)(zones[i].h * scaleY));
     }
 
-    // Staging texture for GPU->CPU readback of the mip surface
-    // We create a DEFAULT texture with GENERATE_MIPS, then copy mip 3 to a STAGING texture.
     ID3D11Texture2D* mipStaging = nullptr;
     D3D11_TEXTURE2D_DESC stagDesc{};
     stagDesc.Width              = mipW;
@@ -267,12 +329,11 @@ int main(int argc, char* argv[]) {
     stagDesc.CPUAccessFlags     = D3D11_CPU_ACCESS_READ;
     d3dDev->CreateTexture2D(&stagDesc, nullptr, &mipStaging);
 
-    // Full-res DEFAULT+SHADER_RESOURCE texture with auto-generated mips
     ID3D11Texture2D* mipGenTex = nullptr;
     D3D11_TEXTURE2D_DESC mipDesc{};
     mipDesc.Width              = fullW;
     mipDesc.Height             = fullH;
-    mipDesc.MipLevels          = 0;  // let D3D compute the full mip chain
+    mipDesc.MipLevels          = 0;
     mipDesc.ArraySize          = 1;
     mipDesc.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
     mipDesc.SampleDesc.Count   = 1;
@@ -284,14 +345,11 @@ int main(int argc, char* argv[]) {
     ID3D11ShaderResourceView* mipSRV = nullptr;
     d3dDev->CreateShaderResourceView(mipGenTex, nullptr, &mipSRV);
 
-    // -----------------------------------------------------------------------
-    // Main loop
-    // -----------------------------------------------------------------------
     float frameInterval_ms = 1000.0f / target_fps;
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
 
-    std::cout << "[capture] Running. Press Ctrl+C to stop.\n";
+    std::cout << "[capture] Running Prismatik Movies.ini profile ambient capture.\n";
 
     while (true) {
         QueryPerformanceCounter(&t0);
@@ -299,17 +357,13 @@ int main(int argc, char* argv[]) {
         DXGI_OUTDUPL_FRAME_INFO frameInfo{};
         IDXGIResource* res = nullptr;
 
-        // AcquireNextFrame(0) = non-blocking, instant (key difference from dxcam's blocking wait)
         hr = dupl->AcquireNextFrame(0, &frameInfo, &res);
 
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            // No new frame since last acquire — skip processing, send keepalive if needed
-            // (handled at end of loop with timing)
             goto frame_done;
         }
 
         if (FAILED(hr)) {
-            // Lost duplication (e.g. resolution change, UAC prompt) — try to recreate
             if (dupl) { dupl->Release(); dupl = nullptr; }
             Sleep(200);
             hr = output1->DuplicateOutput(d3dDev, &dupl);
@@ -317,19 +371,13 @@ int main(int argc, char* argv[]) {
         }
 
         {
-            // Get the acquired desktop texture
             ID3D11Texture2D* acqTex = nullptr;
             res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&acqTex);
 
-            // Copy full-res frame into the mip-chain texture (subresource 0 = top mip)
             d3dCtx->CopySubresourceRegion(mipGenTex, 0, 0, 0, 0, acqTex, 0, nullptr);
-
-            // GPU generates mip chain (this is the Prismatik trick: GPU downscale)
             d3dCtx->GenerateMips(mipSRV);
 
-            // Copy just mip level MIP_LEVEL (/8) to staging texture for CPU readback
             UINT srcSubresource = D3D11CalcSubresource(MIP_LEVEL, 0,
-                                    /*mipLevels — compute from fullW*/
                                     (UINT)(std::log2(std::max(fullW, fullH))) + 1);
             d3dCtx->CopySubresourceRegion(mipStaging, 0, 0, 0, 0,
                                           mipGenTex, srcSubresource, nullptr);
@@ -338,11 +386,10 @@ int main(int argc, char* argv[]) {
             res->Release();
             dupl->ReleaseFrame();
 
-            // Map staging texture to CPU
             D3D11_MAPPED_SUBRESOURCE mapped{};
             if (SUCCEEDED(d3dCtx->Map(mipStaging, 0, D3D11_MAP_READ, 0, &mapped))) {
                 const uint8_t* px  = (const uint8_t*)mapped.pData;
-                int            rp  = mapped.RowPitch;  // bytes per row (may include padding)
+                int            rp  = mapped.RowPitch;
 
                 for (int i = 0; i < NUM_LEDS; i++) {
                     const Zone& z = mipZones[i];
@@ -354,12 +401,11 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
 
-                    // Accumulate pixels in the zone (at mip resolution, each zone is tiny ~2-8px)
                     uint32_t sumR = 0, sumG = 0, sumB = 0, count = 0;
                     for (int y = y1; y < y2; y++) {
                         const uint32_t* row = (const uint32_t*)(px + y * rp);
                         for (int x = x1; x < x2; x++) {
-                            uint32_t pixel = row[x]; // BGRA
+                            uint32_t pixel = row[x];
                             sumB += (pixel & 0xFF);
                             sumG += ((pixel >> 8) & 0xFF);
                             sumR += ((pixel >> 16) & 0xFF);
@@ -377,19 +423,16 @@ int main(int argc, char* argv[]) {
 
                 d3dCtx->Unmap(mipStaging, 0);
 
-                // Fire UDP packet (non-blocking)
                 sendto(sock, (const char*)pkt.data(), (int)pkt.size(),
                        0, (sockaddr*)&dest, sizeof(dest));
             }
         }
 
 frame_done:
-        // Spin-wait for next frame interval (more precise than sleep)
         QueryPerformanceCounter(&t1);
         double elapsed_ms = (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
         double wait_ms    = frameInterval_ms - elapsed_ms;
         if (wait_ms > 1.5) Sleep((DWORD)(wait_ms - 1.0));
-        // Spin for the remaining < 1ms for precision
         do {
             QueryPerformanceCounter(&t1);
         } while (((t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart) < frameInterval_ms);
