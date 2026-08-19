@@ -302,6 +302,8 @@ int main(int argc, char* argv[]) {
         hr = dupl->AcquireNextFrame(0, &frameInfo, &res);
 
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            // Re-send previous valid DNRGB frame to WLED to maintain continuous smooth stream without packet gaps
+            sendto(sock, (const char*)pkt.data(), (int)pkt.size(), 0, (sockaddr*)&dest, sizeof(dest));
             Sleep(1);
             goto frame_done;
         }
