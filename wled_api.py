@@ -273,12 +273,15 @@ class WLEDClient:
     async def restore_default_state(self) -> bool:
         """
         Exit realtime mode and restore all segments to ON with their default effect/preset,
-        clearing any individual LED overrides.
+        clearing any individual LED overrides dynamically for ANY segment layout.
         """
-        segs_payload = []
-        for sid in [config.SEG0_ID, config.SEG1_ID, config.SEG2_ID, config.SEG_LIGHTBAR_ID, config.SEG3_ID]:
-            if sid >= 0:
-                segs_payload.append({"id": sid, "on": True, "i": []})
+        from state import state
+        discovered = state.wled_segments
+        if discovered:
+            segs_payload = [{"id": int(sid), "on": True, "i": []} for sid in discovered.keys()]
+        else:
+            valid_ids = {config.SEG0_ID, config.SEG1_ID, config.SEG2_ID, config.SEG_LIGHTBAR_ID, config.SEG3_ID}
+            segs_payload = [{"id": sid, "on": True, "i": []} for sid in valid_ids if sid >= 0]
 
         return await self.send_state({
             "live": False,
