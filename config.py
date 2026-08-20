@@ -140,10 +140,11 @@ REV_RED_ZONE    = list(range(16, 20))                         # center 4 LEDs
 # ===================================================================
 # DS4 Virtual Controller
 # ===================================================================
-# Set to true ONLY if you want to emulate a DualShock 4 controller for
-# Sony PC games (GTA V, Spider-Man). Set to false when using an Xbox controller
-# so games don't prioritize the virtual DS4 over your physical Xbox controller.
-ENABLE_VIRTUAL_DS4: bool = _get("ENABLE_VIRTUAL_DS4", "false").lower() in ("true", "1", "yes")
+# Set to 'auto' (default) to dynamically attach whenever ANY game launches,
+# 'true' to keep always attached, or 'false' to disable.
+ENABLE_VIRTUAL_DS4_MODE: str = _get("ENABLE_VIRTUAL_DS4", "auto").lower().strip()
+ENABLE_VIRTUAL_DS4: bool = ENABLE_VIRTUAL_DS4_MODE in ("true", "1", "yes")
+ENABLE_VIRTUAL_DS4_AUTO: bool = ENABLE_VIRTUAL_DS4_MODE not in ("false", "0", "no")
 DS4_LIGHTBAR_TIMEOUT: float = 3.0
 
 # ===================================================================

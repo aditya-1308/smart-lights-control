@@ -147,13 +147,16 @@ class LightbarRenderer:
             color_array = [_OFF] * config.LIGHTBAR_TOTAL
 
         # Send to C++ IPC bridge (which streams to WLED via 60 FPS UDP)
-        if color_array != self._last_sent_colors:
+        if color_array != self._last_sent_colors or mode == LightbarMode.DS4_ACTIVE:
             self._last_sent_colors = list(color_array)
             state.update_lightbar_colors(color_array)
             try:
                 from ipc_bridge import ipc_bridge
                 if mode in (LightbarMode.CS2_FLASH, LightbarMode.CS2_PULSE):
                     ipc_bridge.update_raw_lightbar(color_array[:17], color_array[17:])
+                elif mode == LightbarMode.DS4_ACTIVE:
+                    r, g, b = state.get_lightbar_rgb()
+                    ipc_bridge.update_ds4_color(r, g, b)
                 elif mode == LightbarMode.IDLE and not state.is_ds4_active() and state.rpm_pct <= 0:
                     ipc_bridge.clear()
             except Exception:
@@ -166,7 +169,7 @@ class LightbarRenderer:
         if mode in (LightbarMode.CS2_FLASH, LightbarMode.CS2_PULSE):
             return
 
-        ds4_on = state.is_ds4_active(config.DS4_LIGHTBAR_TIMEOUT)
+        ds4_on = state.is_ds4_active()
         # REV_METER activates for ANY positive rpm from telemetry.
         # rpm_pct > 0 means a sim racing game is actively sending data.
         # The visual bar itself only lights up above REV_START_PCT — this is just

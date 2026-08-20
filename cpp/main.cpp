@@ -851,6 +851,20 @@ int main(int argc, char* argv[]) {
 
                 d3dCtx->Unmap(stagingTex, 0);
 
+                // If IPC Seg 0 override is active (e.g. Chroma / CS2 flash), apply override color
+                if (ipc && ipc->seg0_override_active) {
+                    for (int i = 0; i < hw.seg0_count; i++) {
+                        int led_offset = hw.seg0_rev ? (hw.seg0_count - 1 - i) : i;
+                        int target_phys_idx = hw.seg0_start + led_offset;
+                        int pkt_idx = 4 + target_phys_idx * 3;
+                        if (target_phys_idx >= 0 && target_phys_idx < hw.total_leds) {
+                            pkt[pkt_idx]     = ipc->seg0_override_r;
+                            pkt[pkt_idx + 1] = ipc->seg0_override_g;
+                            pkt[pkt_idx + 2] = ipc->seg0_override_b;
+                        }
+                    }
+                }
+
                 // Send non-blocking UDP DNRGB frame covering the entire strip
                 int bytesSent = sendto(sock, (const char*)pkt.data(), (int)pkt.size(),
                                        0, (sockaddr*)&dest, sizeof(dest));

@@ -147,6 +147,29 @@ def _keyboard_grid_to_seg0(grid: List[List[int]]) -> List[RGB]:
 # Chroma REST API Handlers
 # -----------------------------------------------------------------------
 
+@web.middleware
+async def _cors_middleware(request: web.Request, handler):
+    """Allow CORS from any game client or web-based integration."""
+    if request.method == "OPTIONS":
+        response = web.Response(status=200)
+    else:
+        response = await handler(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+    return response
+
+
+async def _handle_version(request: web.Request) -> web.Response:
+    """GET /razer/chromasdk or /chromasdk - Chroma SDK version query."""
+    return web.json_response({
+        "version": "2.14.1",
+        "core": "2.14.1",
+        "device_version": "2.14.1",
+        "result": 0,
+    })
+
+
 async def _handle_init(request: web.Request) -> web.Response:
     """POST /razer/chromasdk - Game registers a Chroma session."""
     global _session_active, _session_id, _last_heartbeat
@@ -176,11 +199,11 @@ async def _handle_init(request: web.Request) -> web.Response:
 
 
 async def _handle_heartbeat(request: web.Request) -> web.Response:
-    """PUT /chromasdk/heartbeat - Game keeps session alive."""
+    """PUT/GET /chromasdk/heartbeat - Game keeps session alive."""
     global _last_heartbeat
     _last_heartbeat = time.monotonic()
     state.chroma_last_heartbeat = _last_heartbeat
-    return web.json_response({"tick": 1})
+    return web.json_response({"tick": 1, "result": 0})
 
 
 async def _handle_keyboard(request: web.Request) -> web.Response:
@@ -195,35 +218,60 @@ async def _handle_keyboard(request: web.Request) -> web.Response:
 
     effect = payload.get("effect", "")
 
+    try:
+        from ipc_bridge import ipc_bridge
+    except ImportError:
+        ipc_bridge = None
+
     if effect == "CHROMA_CUSTOM" or effect == "CHROMA_CUSTOM2":
         grid = payload.get("param", [])
         if grid:
             colors = _keyboard_grid_to_seg0(grid)
             state.update_seg0_colors(colors)
+            if ipc_bridge and colors:
+                # Calculate average color across the grid for 60 FPS C++ engine
+                avg_r = int(sum(c[0] for c in colors) / len(colors))
+                avg_g = int(sum(c[1] for c in colors) / len(colors))
+                avg_b = int(sum(c[2] for c in colors) / len(colors))
+                ipc_bridge.update_seg0_override(avg_r, avg_g, avg_b)
     elif effect == "CHROMA_STATIC":
         color_val = payload.get("param", {}).get("color", 0)
         rgb = _bgr_int_to_rgb(color_val)
         state.update_seg0_colors([rgb] * config.SEG0_COUNT)
+        if ipc_bridge:
+            ipc_bridge.update_seg0_override(rgb[0], rgb[1], rgb[2])
     elif effect == "CHROMA_NONE":
         state.update_seg0_colors([(0, 0, 0)] * config.SEG0_COUNT)
+        if ipc_bridge:
+            ipc_bridge.clear_seg0_override()
 
     return web.json_response({"result": 0})
 
 
 async def _handle_mouse(request: web.Request) -> web.Response:
-    """PUT/POST /chromasdk/mouse - Acknowledge but ignore."""
+    """PUT/POST /chromasdk/mouse - Receive mouse color payload."""
     global _last_heartbeat
     _last_heartbeat = time.monotonic()
+    try:
+        payload = await request.json()
+        effect = payload.get("effect", "")
+        if effect == "CHROMA_STATIC":
+            color_val = payload.get("param", {}).get("color", 0)
+            rgb = _bgr_int_to_rgb(color_val)
+            try:
+                from ipc_bridge import ipc_bridge
+                ipc_bridge.update_seg0_override(rgb[0], rgb[1], rgb[2])
+            except Exception:
+                pass
+    except Exception:
+        pass
     return web.json_response({"result": 0})
 
 
-async def _handle_mousepad(request: web.Request) -> web.Response:
-    """PUT/POST /chromasdk/mousepad - Acknowledge but ignore."""
-    return web.json_response({"result": 0})
-
-
-async def _handle_chromalink(request: web.Request) -> web.Response:
-    """PUT/POST /chromasdk/chromalink - Acknowledge but ignore."""
+async def _handle_generic_device(request: web.Request) -> web.Response:
+    """PUT/POST /chromasdk/device, /chromasdk/effect, /chromasdk/headset, /chromasdk/keypad, /chromasdk/chromalink."""
+    global _last_heartbeat
+    _last_heartbeat = time.monotonic()
     return web.json_response({"result": 0})
 
 
@@ -233,6 +281,11 @@ async def _handle_delete_session(request: web.Request) -> web.Response:
     log.info("Chroma game disconnected.")
     _session_active = False
     state.chroma_active = False
+    try:
+        from ipc_bridge import ipc_bridge
+        ipc_bridge.clear_seg0_override()
+    except Exception:
+        pass
     await state.set_seg0_source(Seg0Source.SCREEN_CAPTURE)
     await state.set_context(AppContext.IDLE)
     return web.json_response({"result": 0})
@@ -249,6 +302,11 @@ async def _heartbeat_watchdog() -> None:
                 log.info("Chroma heartbeat timeout (%.1fs). Releasing Seg 0.", age)
                 _session_active = False
                 state.chroma_active = False
+                try:
+                    from ipc_bridge import ipc_bridge
+                    ipc_bridge.clear_seg0_override()
+                except Exception:
+                    pass
                 await state.set_seg0_source(Seg0Source.SCREEN_CAPTURE)
                 await state.set_context(AppContext.IDLE)
 
@@ -259,24 +317,34 @@ async def _heartbeat_watchdog() -> None:
 
 async def run() -> None:
     """Start the Chroma REST API server."""
-    app = web.Application()
+    app = web.Application(middlewares=[_cors_middleware])
+
+    # Version queries
+    app.router.add_get("/razer/chromasdk", _handle_version)
+    app.router.add_get("/chromasdk", _handle_version)
 
     # Session init
     app.router.add_post("/razer/chromasdk", _handle_init)
+    app.router.add_post("/chromasdk", _handle_init)
 
     # Session management
+    app.router.add_get("/chromasdk/heartbeat", _handle_heartbeat)
     app.router.add_put("/chromasdk/heartbeat", _handle_heartbeat)
     app.router.add_delete("/chromasdk", _handle_delete_session)
 
     # Device endpoints
-    app.router.add_put("/chromasdk/keyboard", _handle_keyboard)
-    app.router.add_post("/chromasdk/keyboard", _handle_keyboard)
-    app.router.add_put("/chromasdk/mouse", _handle_mouse)
-    app.router.add_post("/chromasdk/mouse", _handle_mouse)
-    app.router.add_put("/chromasdk/mousepad", _handle_mousepad)
-    app.router.add_post("/chromasdk/mousepad", _handle_mousepad)
-    app.router.add_put("/chromasdk/chromalink", _handle_chromalink)
-    app.router.add_post("/chromasdk/chromalink", _handle_chromalink)
+    for route in ["/chromasdk/keyboard", "/chromasdk/mouse", "/chromasdk/mousepad",
+                  "/chromasdk/headset", "/chromasdk/keypad", "/chromasdk/chromalink",
+                  "/chromasdk/device", "/chromasdk/effect", "/chromasdk/app"]:
+        if "keyboard" in route:
+            app.router.add_put(route, _handle_keyboard)
+            app.router.add_post(route, _handle_keyboard)
+        elif "mouse" in route and "mousepad" not in route:
+            app.router.add_put(route, _handle_mouse)
+            app.router.add_post(route, _handle_mouse)
+        else:
+            app.router.add_put(route, _handle_generic_device)
+            app.router.add_post(route, _handle_generic_device)
 
     runner = web.AppRunner(app)
     await runner.setup()

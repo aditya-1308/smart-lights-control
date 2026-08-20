@@ -171,6 +171,29 @@ class IPCBridgeWriter:
         except Exception:
             pass
 
+    def update_seg0_override(self, r: int, g: int, b: int) -> None:
+        """Override Segment 0 with a solid color (e.g. Chroma / CS2 flashbang)."""
+        if not self._mmap:
+            if not self._init_shm():
+                return
+        self._sequence += 1
+        try:
+            self._mmap.seek(144)  # offset of seg0_override_active
+            self._mmap.write(bytes([1, max(0, min(255, int(r))), max(0, min(255, int(g))), max(0, min(255, int(b)))]))
+        except Exception:
+            pass
+
+    def clear_seg0_override(self) -> None:
+        """Clear Segment 0 override so it returns to 60 FPS DXGI screen capture."""
+        if not self._mmap:
+            return
+        self._sequence += 1
+        try:
+            self._mmap.seek(144)  # offset of seg0_override_active
+            self._mmap.write(b"\x00\x00\x00\x00")
+        except Exception:
+            pass
+
     def clear(self) -> None:
         """Clear active mode so C++ engine returns to default ambient behavior."""
         if not self._mmap:

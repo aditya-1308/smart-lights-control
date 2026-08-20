@@ -152,9 +152,8 @@ class SharedState:
             return float("inf")
         return time.monotonic() - last
 
-    def is_ds4_active(self, timeout: float = 3.0) -> bool:
-        """True if DS4 lightbar data arrived within ``timeout`` seconds
-        and the color is not black (0, 0, 0)."""
+    def is_ds4_active(self, timeout: float = 300.0) -> bool:
+        """True if DS4 lightbar data is active and the color is not black (0, 0, 0)."""
         if self.lightbar_age() > timeout:
             return False
         r, g, b = self._lightbar_rgb

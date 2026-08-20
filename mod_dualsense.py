@@ -1,23 +1,21 @@
 """
 mod_dualsense.py - Dynamic Virtual DS4 controller + lightbar interception.
 
-Auto-detects when a PlayStation lightbar game (GTA V, Cyberpunk, Spider-Man,
-Death Stranding, etc.) is launched and dynamically attaches the virtual DS4
-controller AFTER your physical Xbox controller has already claimed Index 0.
+Auto-detects when ANY game (PlayStation PC ports, Steam, Epic, EA, Ubisoft, Xbox, etc.)
+is launched and dynamically attaches the virtual DS4 controller.
 
 When the game closes, it automatically detaches the virtual DS4 so your
-Xbox controller remains completely uninterrupted in Assetto Corsa and other games.
+Xbox controller / physical controller remains completely uninterrupted.
 """
 
 import asyncio
 import ctypes
 import ctypes.wintypes
 import logging
-import threading
 import time
 from ctypes import (
     CDLL, CFUNCTYPE, POINTER, Structure,
-    c_int, c_ubyte, c_ulong, c_void_p,
+    c_int, c_ubyte, c_ulong, c_uint, c_void_p,
 )
 from pathlib import Path
 from typing import Optional, Set
@@ -28,39 +26,191 @@ try:
 except ImportError:
     VGAMEPAD_AVAILABLE = False
 
+try:
+    import win32gui
+    import win32process
+    PYWIN32_AVAILABLE = True
+except ImportError:
+    PYWIN32_AVAILABLE = False
+
 import config
 from state import state
 
 log = logging.getLogger("dualsense")
 
-# List of known PC games with native DualShock 4 / DualSense lightbar support
-_DS4_GAMES: Set[str] = {
-    "gta5.exe",
-    "cyberpunk2077.exe",
+# Known game executables with native DualShock 4 / DualSense lightbar or controller support
+_KNOWN_GAMES: Set[str] = {
+    # Sony PlayStation PC ports
     "spiderman.exe",
     "spidermanmilesmorales.exe",
-    "deathstranding.exe",
-    "ds.exe",
-    "horizonzerodawn.exe",
-    "horizonforbiddenwest.exe",
+    "spiderman2.exe",
     "gow.exe",
     "godofwar.exe",
+    "godofwarragnarok.exe",
     "thelastofus.exe",
     "tlou-i.exe",
+    "thelastofusparti.exe",
+    "horizonzerodawn.exe",
+    "horizonforbiddenwest.exe",
+    "ghostoftsushima.exe",
+    "daysgone.exe",
+    "deathstranding.exe",
+    "ds.exe",
+    "returnal.exe",
     "ratchet.exe",
     "uncharted.exe",
     "u4.exe",
-    "daysgone.exe",
-    "ghostoftsushima.exe",
-    "returnal.exe",
     "helldivers2.exe",
-    "detroitbecomehuman.exe",
     "untildawn.exe",
+    "detroitbecomehuman.exe",
+    "beyondtwosouls.exe",
+    "heavyrain.exe",
+    "sackboy.exe",
+
+    # Rockstar
+    "gta5.exe",
+    "gtav.exe",
+    "rdr2.exe",
+    "reddeadredemption2.exe",
+
+    # CD Projekt Red
+    "cyberpunk2077.exe",
+    "witcher3.exe",
+
+    # Ubisoft
+    "farcry5.exe",
+    "farcry6.exe",
+    "acvalhalla.exe",
+    "acmirage.exe",
+    "acshadows.exe",
+    "watchdogslegion.exe",
+    "thecrew2.exe",
+    "thecrew-motorfest.exe",
+    "avatar_fop.exe",
+
+    # EA / Sim / Racing / Sports
+    "f1_2022.exe",
+    "f1_2023.exe",
+    "f1_2024.exe",
+    "f1_2025.exe",
+    "f1_23.exe",
+    "f1_24.exe",
+    "f1_25.exe",
+    "f1.exe",
+    "fc24.exe",
+    "fc25.exe",
+    "fifa23.exe",
+    "fifa22.exe",
+    "nfsunbound.exe",
+    "nfsheat.exe",
+    "jedifallenorder.exe",
+    "jedisurvivor.exe",
+    "deadspace.exe",
+    "apexlegends.exe",
+    "r5apex.exe",
+
+    # Capcom / Square Enix / Bandai / Others
+    "re4.exe",
+    "re7.exe",
+    "re8.exe",
+    "re2.exe",
+    "re3.exe",
+    "re9.exe",
+    "village.exe",
+    "ff7remake_.exe",
+    "ff7rebirth.exe",
+    "ffxvi.exe",
+    "ffxv.exe",
+    "monsterhunterwilds.exe",
+    "monsterhunterworld.exe",
+    "monsterhunterrise.exe",
+    "eldenring.exe",
+    "armoredcore6.exe",
+    "sekiro.exe",
+    "darksouls3.exe",
+    "liesofp.exe",
+    "blackmythwukong.exe",
+    "wukong.exe",
+    "control.exe",
+    "alanwake2.exe",
+    "deathloop.exe",
+    "ghostwiretokyo.exe",
+    "sifu.exe",
+    "hifirush.exe",
+    "metroexodus.exe",
+    "warframe.x64.exe",
+    "warframe.exe",
+    "cs2.exe",
+    "csgo.exe",
+    "valorant.exe",
+    "overwatch.exe",
+    "fortniteclient-win64-shipping.exe",
+}
+
+# Non-game system and desktop processes to ignore during foreground window checks
+_IGNORED_PROCESSES: Set[str] = {
+    "explorer.exe",
+    "taskmgr.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "devenv.exe",
+    "code.exe",
+    "sublime_text.exe",
+    "notepad.exe",
+    "notepad++.exe",
+    "calc.exe",
+    "systemsettings.exe",
+    "windowsterminal.exe",
+    "searchhost.exe",
+    "shellexperiencehost.exe",
+    "applicationframehost.exe",
+    "lockapp.exe",
+    "startmenuexperiencehost.exe",
+    "rainmeter.exe",
+    "yasb.exe",
+    "windhawk.exe",
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "opera_gx.exe",
+    "vivaldi.exe",
+    "zen.exe",
+    "tor.exe",
+    "discord.exe",
+    "spotify.exe",
+    "telegram.exe",
+    "slack.exe",
+    "teams.exe",
+    "zoom.exe",
+    "obs64.exe",
+    "obs32.exe",
+    "vlc.exe",
+    "monectserver.exe",
+    "monectserverservice.exe",
+    "pcremotereceiver.exe",
+    "steam.exe",
+    "steamwebhelper.exe",
+    "epicgameslauncher.exe",
+    "galaxyclient.exe",
+    "ea.exe",
+    "eadesktop.exe",
+    "origin.exe",
+    "battlenet.exe",
+    "ubisoftconnect.exe",
+    "upc.exe",
+    "riotclientservices.exe",
+    "xboxpcapp.exe",
+    "gog.exe",
+    "python.exe",
+    "roomlights_capture.exe",
 }
 
 
 # ---------------------------------------------------------------------------
-# Win32 Process Snapshot Helper (ultra-fast < 0.2ms check)
+# Win32 Process Snapshot & Foreground Window Check
 # ---------------------------------------------------------------------------
 class PROCESSENTRY32(ctypes.Structure):
     _fields_ = [
@@ -77,29 +227,53 @@ class PROCESSENTRY32(ctypes.Structure):
     ]
 
 
-def is_ds4_game_running() -> bool:
-    """Check if any game with PS lightbar support is currently running."""
+def is_game_running() -> bool:
+    """
+    Check if any game is currently running:
+    1. Checks all active background processes against known game database.
+    2. Inspects foreground window process to detect any newly released or unlisted game.
+    """
+    # 1. Check process snapshot
     TH32CS_SNAPPROCESS = 0x00000002
     kernel32 = ctypes.windll.kernel32
     h_snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if h_snapshot == -1 or h_snapshot == 0:
-        return False
+    if h_snapshot != -1 and h_snapshot != 0:
+        pe = PROCESSENTRY32()
+        pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        if kernel32.Process32First(h_snapshot, ctypes.byref(pe)):
+            while True:
+                exe_name = pe.szExeFile.decode("utf-8", errors="ignore").lower()
+                if exe_name in _KNOWN_GAMES:
+                    kernel32.CloseHandle(h_snapshot)
+                    return True
+                if not kernel32.Process32Next(h_snapshot, ctypes.byref(pe)):
+                    break
+        kernel32.CloseHandle(h_snapshot)
 
-    pe = PROCESSENTRY32()
-    pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
-    found = False
+    # 2. Check foreground window
+    if PYWIN32_AVAILABLE:
+        try:
+            hwnd = win32gui.GetForegroundWindow()
+            if hwnd:
+                title = win32gui.GetWindowText(hwnd).strip()
+                if title:
+                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    if pid:
+                        h_proc = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+                        if h_proc:
+                            buf = (ctypes.c_char * 260)()
+                            size = ctypes.wintypes.DWORD(260)
+                            if kernel32.QueryFullProcessImageNameA(h_proc, 0, buf, ctypes.byref(size)):
+                                exe = buf.value.decode("utf-8", errors="ignore").split("\\")[-1].lower()
+                                kernel32.CloseHandle(h_proc)
+                                if exe and exe not in _IGNORED_PROCESSES:
+                                    return True
+                            else:
+                                kernel32.CloseHandle(h_proc)
+        except Exception:
+            pass
 
-    if kernel32.Process32First(h_snapshot, ctypes.byref(pe)):
-        while True:
-            exe_name = pe.szExeFile.decode("utf-8", errors="ignore").lower()
-            if exe_name in _DS4_GAMES:
-                found = True
-                break
-            if not kernel32.Process32Next(h_snapshot, ctypes.byref(pe)):
-                break
-
-    kernel32.CloseHandle(h_snapshot)
-    return found
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +326,6 @@ class VirtualDS4Controller:
     def __init__(self) -> None:
         self._gamepad: Optional[object] = None
         self._vigem: Optional[CDLL] = None
-        self._client: Optional[c_void_p] = None
-        self._target: Optional[c_void_p] = None
         self._cb_ref = None
         self._is_active = False
 
@@ -165,55 +337,77 @@ class VirtualDS4Controller:
         if self._is_active:
             return True
         if not VGAMEPAD_AVAILABLE:
+            log.warning("vgamepad is not installed.")
             return False
 
         try:
             self._gamepad = vg.VDS4Gamepad()
-            log.info("Virtual DS4 attached dynamically.")
+            log.info("Virtual DS4 allocated on ViGEmBus.")
         except Exception as exc:
             log.warning("Could not attach virtual DS4: %s", exc)
             return False
 
         dll_path = _find_vigem_dll()
         if dll_path is None:
+            log.warning("ViGEmClient.dll not found on system.")
             return False
 
         try:
             self._vigem = ctypes.CDLL(str(dll_path))
-            self._client = self._gamepad._client  # type: ignore[attr-defined]
-            self._target = self._gamepad._target  # type: ignore[attr-defined]
-        except Exception:
+
+            # Set 64-bit argtypes and restype for ViGEm C API
+            self._vigem.vigem_target_ds4_register_notification.argtypes = [
+                c_void_p,
+                c_void_p,
+                DS4_NOTIFICATION_CB,
+                c_void_p,
+            ]
+            self._vigem.vigem_target_ds4_register_notification.restype = c_ulong
+
+            self._vigem.vigem_target_ds4_unregister_notification.argtypes = [c_void_p]
+            self._vigem.vigem_target_ds4_unregister_notification.restype = None
+
+            cb = DS4_NOTIFICATION_CB(self._on_ds4_notification)
+            self._cb_ref = cb
+
+            # In vgamepad, _busp is the client pointer and _devicep is the target device pointer
+            bus_ptr = c_void_p(self._gamepad._busp)
+            dev_ptr = c_void_p(self._gamepad._devicep)
+
+            err = self._vigem.vigem_target_ds4_register_notification(
+                bus_ptr, dev_ptr, cb, None
+            )
+            # 0x20000000 is VIGEM_ERROR_NONE (536870912)
+            if err != 0x20000000 and err != 0:
+                log.warning("vigem_target_ds4_register_notification returned: 0x%X", err)
+                return False
+
+            self._is_active = True
+            log.info("Virtual DS4 connected & listening for PlayStation lightbar events.")
+            return True
+        except Exception as exc:
+            log.warning("Failed to register DS4 notification: %s", exc)
             return False
-
-        cb = DS4_NOTIFICATION_CB(self._on_ds4_notification)
-        self._cb_ref = cb
-
-        self._vigem.vigem_target_ds4_register_notification.argtypes = [
-            c_void_p,
-            c_void_p,
-            DS4_NOTIFICATION_CB,
-            c_void_p,
-        ]
-        err = self._vigem.vigem_target_ds4_register_notification(
-            self._client, self._target, cb, None
-        )
-        if err != 0:
-            return False
-
-        self._is_active = True
-        log.info("Virtual DS4 listening for game lightbar output.")
-        return True
 
     def stop(self) -> None:
         if not self._is_active:
             return
         self._is_active = False
-        if self._vigem and self._client and self._target:
+        if self._vigem and self._gamepad:
             try:
-                self._vigem.vigem_target_ds4_unregister_notification(self._target)
+                self._vigem.vigem_target_ds4_unregister_notification(
+                    c_void_p(self._gamepad._devicep)
+                )
             except Exception:
                 pass
         self._gamepad = None
+        self._cb_ref = None
+        state.set_lightbar_rgb(0, 0, 0)
+        try:
+            from ipc_bridge import ipc_bridge
+            ipc_bridge.clear()
+        except Exception:
+            pass
         log.info("Virtual DS4 detached.")
 
     def _on_ds4_notification(
@@ -234,22 +428,31 @@ class VirtualDS4Controller:
 async def run(controller: VirtualDS4Controller) -> None:
     """
     Supervises the DS4 controller:
-    - Auto-starts when a supported game is launched.
-    - Auto-stops when the game closes.
+    - Auto-starts when any game is launched.
+    - Auto-stops after confirmed game exit (debounced to prevent connect/disconnect loops).
     """
-    log.info("DS4 auto-detector running (waiting for PlayStation lightbar games)...")
+    log.info("DS4 auto-detector running (auto-detects all games)...")
+
+    consecutive_inactive = 0
+    # 4 consecutive checks * 1.5s = 6.0s sustained inactivity before detaching
+    INACTIVE_DEBOUNCE_TICKS = 4
 
     while not state.shutdown_event.is_set():
-        game_active = await asyncio.to_thread(is_ds4_game_running)
+        game_active = await asyncio.to_thread(is_game_running)
 
-        if config.ENABLE_VIRTUAL_DS4 or game_active:
+        should_attach = config.ENABLE_VIRTUAL_DS4 or (config.ENABLE_VIRTUAL_DS4_AUTO and game_active)
+
+        if should_attach:
+            consecutive_inactive = 0
             if not controller.is_active:
                 await asyncio.to_thread(controller.start)
         else:
-            if controller.is_active:
+            consecutive_inactive += 1
+            if controller.is_active and consecutive_inactive >= INACTIVE_DEBOUNCE_TICKS:
                 await asyncio.to_thread(controller.stop)
 
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.5)
 
     await asyncio.to_thread(controller.stop)
     log.info("DS4 module stopped.")
+
