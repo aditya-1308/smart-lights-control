@@ -879,7 +879,7 @@ int main(int argc, char* argv[]) {
                     std::string active_source = "IDLE";
                     float cur_rpm = 0.0f;
                     if (ac_active && ac_rpm > 0.0f) { active_source = "AC_NATIVE"; cur_rpm = ac_rpm; }
-                    else if (ipc && ipc->lightbar_mode == 1 && ipc->rpm_pct > 0.0f) { active_source = "SIMRACING_IPC"; cur_rpm = ipc->rpm_pct; }
+                    else if (ipc && (ipc->lightbar_mode == 1 || ipc->rpm_pct > 0.0f)) { active_source = "SIMRACING_IPC"; cur_rpm = ipc->rpm_pct; }
                     else if (ipc && ipc->lightbar_mode == 2) { active_source = "DS4_LIGHTBAR"; }
                     else if (ipc && ipc->lightbar_mode == 3) { active_source = "CUSTOM_ARRAY"; }
 

@@ -147,7 +147,7 @@ class LightbarRenderer:
             color_array = [_OFF] * config.LIGHTBAR_TOTAL
 
         # Send to C++ IPC bridge (which streams to WLED via 60 FPS UDP)
-        if color_array != self._last_sent_colors or mode == LightbarMode.DS4_ACTIVE:
+        if color_array != self._last_sent_colors or mode in (LightbarMode.DS4_ACTIVE, LightbarMode.REV_METER):
             self._last_sent_colors = list(color_array)
             state.update_lightbar_colors(color_array)
             try:

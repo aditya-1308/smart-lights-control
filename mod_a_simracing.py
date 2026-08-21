@@ -61,7 +61,7 @@ class ACUDPReader:
         self._sock: Optional[socket.socket] = None
         self._max_rpm_seen: float = 1000.0
         self._last_handshake: float = 0.0
-        self._last_received: float = 0.0  # time of last valid telemetry packet
+        self._last_received: float = 0.0
 
     def connect(self) -> bool:
         try:
@@ -104,36 +104,31 @@ class ACUDPReader:
         if now - self._last_handshake > handshake_interval:
             self._send_handshake()
 
-        # Drain socket buffer to get the freshest packet
-        latest_data = None
+        latest_telem_pkt = None
         while True:
             try:
                 data, _ = self._sock.recvfrom(2048)
                 if data:
-                    latest_data = data
+                    if len(data) == 408:
+                        # Handshake response (RTCarStatic)
+                        self._last_received = now
+                        try:
+                            static_max = struct.unpack_from("<i", data, 402)[0]
+                            if static_max > 1000:
+                                self._max_rpm_seen = float(static_max)
+                        except Exception:
+                            pass
+                    elif len(data) >= 80:
+                        latest_telem_pkt = data
             except (BlockingIOError, OSError):
                 break
 
-        if not latest_data:
-            return None
-
-        # 408 bytes = AC Handshake Response packet (RTCarStatic)
-        if len(latest_data) == 408:
-            self._last_received = now
-            try:
-                static_max = struct.unpack_from("<i", latest_data, 402)[0]
-                if static_max > 1000:
-                    self._max_rpm_seen = float(static_max)
-            except Exception:
-                pass
-            return None
-
-        if len(latest_data) < 80:
+        if not latest_telem_pkt:
             return None
 
         try:
-            is_limiter = latest_data[29] if len(latest_data) > 29 else 0
-            engine_rpm = struct.unpack_from("<f", latest_data, 72)[0]
+            is_limiter = latest_telem_pkt[29] if len(latest_telem_pkt) > 29 else 0
+            engine_rpm = struct.unpack_from("<f", latest_telem_pkt, 72)[0]
 
             if engine_rpm <= 0.0:
                 return 0.0
@@ -149,92 +144,6 @@ class ACUDPReader:
             return max(0.0, min(1.0, engine_rpm / self._max_rpm_seen))
         except Exception:
             return None
-
-
-class ACSharedMemoryReader:
-    """Reads engine RPM directly from Assetto Corsa Windows Shared Memory (acpmf_physics)."""
-
-    def __init__(self) -> None:
-        self._physics_mmap: Optional[mmap.mmap] = None
-        self._static_mmap: Optional[mmap.mmap] = None
-        self._max_rpm: float = 1000.0
-
-    def connect(self) -> bool:
-        try:
-            import mmap as mmap_mod
-            self._physics_mmap = mmap_mod.mmap(-1, 712, "acpmf_physics")
-            try:
-                self._static_mmap = mmap_mod.mmap(-1, 712, "acpmf_static")
-                static_data = self._static_mmap.read(410)
-                max_rpm = struct.unpack_from("<i", static_data, 402)[0]
-                if max_rpm > 1000:
-                    self._max_rpm = float(max_rpm)
-            except Exception:
-                pass
-            log.info("Assetto Corsa Shared Memory (acpmf_physics) connected!")
-            return True
-        except Exception:
-            return False
-
-    def disconnect(self) -> None:
-        if self._physics_mmap:
-            try:
-                self._physics_mmap.close()
-            except Exception:
-                pass
-            self._physics_mmap = None
-        if self._static_mmap:
-            try:
-                self._static_mmap.close()
-            except Exception:
-                pass
-            self._static_mmap = None
-
-    def read_rpm_pct(self) -> Optional[float]:
-        if not self._physics_mmap:
-            if not self.connect():
-                return None
-        try:
-            self._physics_mmap.seek(0)
-            data = self._physics_mmap.read(260)
-            if len(data) < 256:
-                return None
-            packet_id = struct.unpack_from("<i", data, 0)[0]
-            rpms = struct.unpack_from("<i", data, 20)[0]
-            pit_limiter = struct.unpack_from("<i", data, 248)[0]
-            if rpms <= 0 or packet_id <= 0:
-                return None
-            if pit_limiter:
-                return 1.0
-            if float(rpms) > self._max_rpm:
-                self._max_rpm = float(rpms)
-            return max(0.0, min(1.0, float(rpms) / self._max_rpm))
-        except Exception:
-            self.disconnect()
-            return None
-
-
-class ACReader:
-    """Unified Assetto Corsa Telemetry Reader (Shared Memory + UDP fallback)."""
-
-    def __init__(self, port: int = 9996) -> None:
-        self._shm = ACSharedMemoryReader()
-        self._udp = ACUDPReader(port)
-
-    def connect(self) -> bool:
-        self._shm.connect()
-        self._udp.connect()
-        return True
-
-    def disconnect(self) -> None:
-        self._shm.disconnect()
-        self._udp.disconnect()
-
-    def read_rpm_pct(self) -> Optional[float]:
-        pct = self._shm.read_rpm_pct()
-        if pct is not None:
-            return pct
-        return self._udp.read_rpm_pct()
 
 
 # ===========================================================================
@@ -268,43 +177,39 @@ class F1Reader:
         if not self._sock:
             return None
 
-        latest_data = None
+        latest_telem_pkt = None
         while True:
             try:
                 data, _ = self._sock.recvfrom(2048)
-                if data:
-                    latest_data = data
+                if data and len(data) >= 30:
+                    pkt_format = struct.unpack_from("<H", data, 0)[0]
+                    if pkt_format in (2020, 2021, 2022, 2023, 2024, 2025):
+                        pkt_id = data[6] if pkt_format >= 2023 else data[5]
+                        if pkt_id == 6:  # 6 = PacketCarTelemetryData
+                            latest_telem_pkt = data
             except (BlockingIOError, OSError):
                 break
 
-        if not latest_data or len(latest_data) < 30:
+        if not latest_telem_pkt:
             return None
 
-        packet_format = struct.unpack_from("<H", latest_data, 0)[0]
-        if packet_format not in (2020, 2021, 2022, 2023, 2024, 2025):
-            return None
-
+        packet_format = struct.unpack_from("<H", latest_telem_pkt, 0)[0]
         if packet_format >= 2023:
             header_size = 29
-            packet_id = latest_data[6]
-            player_idx = latest_data[27]
+            player_idx = latest_telem_pkt[27]
         else:
             header_size = 24
-            packet_id = latest_data[5]
-            player_idx = latest_data[22]
-
-        if packet_id != 6:  # 6 = PacketCarTelemetryData
-            return None
+            player_idx = latest_telem_pkt[22]
 
         if player_idx < 0 or player_idx >= 22:
             player_idx = 0
 
         car_offset = header_size + player_idx * 60
-        if len(latest_data) < car_offset + 22:
+        if len(latest_telem_pkt) < car_offset + 22:
             return None
 
-        engine_rpm = struct.unpack_from("<H", latest_data, car_offset + 16)[0]
-        rev_lights_pct = latest_data[car_offset + 19]
+        engine_rpm = struct.unpack_from("<H", latest_telem_pkt, car_offset + 16)[0]
+        rev_lights_pct = latest_telem_pkt[car_offset + 19]
 
         if engine_rpm <= 0:
             return 0.0
@@ -324,53 +229,105 @@ class F1Reader:
 # Automobilista 2 (AMS2) — UDP port 5606
 # ===========================================================================
 class AMS2Reader:
-    """Reads RPM from Automobilista 2 via Project CARS 2 UDP protocol (port 5606)."""
+    """Reads RPM from Automobilista 2 / Project CARS 2 via Shared Memory ($pcars2$) and UDP port 5606."""
 
     def __init__(self) -> None:
         self._sock: Optional[socket.socket] = None
+        self._shm: Optional[object] = None
         self._port: int = config.AMS2_UDP_PORT
         self._max_rpm_seen: float = 1000.0
 
     def connect(self) -> bool:
+        import mmap as mmap_mod
+        for shm_name in ["$pcars2$", "$pcars$"]:
+            try:
+                self._shm = mmap_mod.mmap(-1, 16384, shm_name)
+                log.info("AMS2 Shared Memory connected ('%s')!", shm_name)
+                break
+            except Exception:
+                self._shm = None
+
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self._sock.bind(("0.0.0.0", self._port))
             self._sock.setblocking(False)
             log.info("AMS2 UDP listener bound on port %d.", self._port)
-            return True
-        except OSError as exc:
-            log.error("AMS2 UDP bind failed: %s", exc)
-            return False
+        except OSError:
+            self._sock = None
+
+        return (self._shm is not None) or (self._sock is not None)
 
     def disconnect(self) -> None:
+        if self._shm:
+            try:
+                self._shm.close()
+            except Exception:
+                pass
+            self._shm = None
         if self._sock:
-            self._sock.close()
+            try:
+                self._sock.close()
+            except Exception:
+                pass
             self._sock = None
 
     def read_rpm_pct(self) -> Optional[float]:
+        # 1. Read from Shared Memory ($pcars2$)
+        if not self._shm:
+            import mmap as mmap_mod
+            for shm_name in ["$pcars2$", "$pcars$"]:
+                try:
+                    self._shm = mmap_mod.mmap(-1, 16384, shm_name)
+                    break
+                except Exception:
+                    self._shm = None
+
+        if self._shm:
+            try:
+                self._shm.seek(0)
+                data = self._shm.read(8192)
+                if len(data) >= 6860:
+                    game_state = struct.unpack_from("<I", data, 8)[0]
+                    # 2 = INGAME_PLAYING, 3 = INGAME_PAUSED, 4 = INGAME_INMENU_TIME_TICKING, 5 = INGAME_RESTARTING
+                    if game_state in (2, 3, 4, 5):
+                        # AMS2 / PCARS2 64-bit offsets: 6852 (RPM), 6856 (MaxRPM)
+                        rpm = struct.unpack_from("<f", data, 6852)[0]
+                        max_rpm = struct.unpack_from("<f", data, 6856)[0]
+                        if max_rpm < 500.0 or max_rpm > 30000.0:
+                            rpm = struct.unpack_from("<f", data, 3664)[0]
+                            max_rpm = struct.unpack_from("<f", data, 3668)[0]
+
+                        if max_rpm > 1000.0:
+                            self._max_rpm_seen = max_rpm
+                        elif rpm > self._max_rpm_seen:
+                            self._max_rpm_seen = rpm
+
+                        if self._max_rpm_seen > 0:
+                            return max(0.0, min(1.0, rpm / self._max_rpm_seen))
+            except Exception:
+                self.disconnect()
+
+        # 2. Read from UDP socket
         if not self._sock:
             return None
 
-        latest_data = None
+        latest_physics_pkt = None
         while True:
             try:
                 data, _ = self._sock.recvfrom(4096)
-                if data:
-                    latest_data = data
+                if data and len(data) >= 130:
+                    pkt_type = data[10] & 3
+                    if pkt_type == 0:  # 0 = sTelemetryData (CarPhysics)
+                        latest_physics_pkt = data
             except (BlockingIOError, OSError):
                 break
 
-        if not latest_data or len(latest_data) < 130:
+        if not latest_physics_pkt:
             return None
 
-        # Packet type 0 is sTelemetryData (CarPhysics)
-        pkt_type = latest_data[10] & 3 if len(latest_data) > 10 else 255
-        if pkt_type != 0:
-            return None
-
-        rpm = struct.unpack_from("<H", latest_data, 124)[0]
-        max_rpm = struct.unpack_from("<H", latest_data, 126)[0]
+        rpm = struct.unpack_from("<H", latest_physics_pkt, 124)[0]
+        max_rpm = struct.unpack_from("<H", latest_physics_pkt, 126)[0]
 
         if max_rpm > 1000:
             self._max_rpm_seen = float(max_rpm)
@@ -418,12 +375,12 @@ class ForzaReader:
         while True:
             try:
                 data, _ = self._sock.recvfrom(512)
-                if data:
+                if data and len(data) >= 20:
                     latest_data = data
             except (BlockingIOError, OSError):
                 break
 
-        if not latest_data or len(latest_data) < 20:
+        if not latest_data:
             return None
 
         is_race_on = struct.unpack_from("<i", latest_data, 0)[0]
@@ -438,41 +395,42 @@ class ForzaReader:
 
 
 # ===========================================================================
-# Async run loops
+# Unified Non-Conflicting Supervisor Loop
 # ===========================================================================
-
 async def run() -> None:
-    log.info("Universal sim racing telemetry starting (AC SHM+UDP + F1 + AMS2 + Forza)...")
-    tasks = [
-        _run_udp_reader("AC Telemetry", ACReader(config.AC_UDP_PORT)),
-        _run_udp_reader("F1",           F1Reader()),
-        _run_udp_reader("AMS2",         AMS2Reader()),
-        _run_udp_reader("Forza",        ForzaReader()),
+    log.info("Universal sim racing telemetry starting (AC UDP + F1 + AMS2 + Forza)...")
+    readers = [
+        ("AC UDP", ACUDPReader(config.AC_UDP_PORT)),
+        ("F1",     F1Reader()),
+        ("AMS2",   AMS2Reader()),
+        ("Forza",  ForzaReader()),
     ]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    for name, r in readers:
+        await asyncio.to_thread(r.connect)
 
-
-async def _run_udp_reader(name: str, reader) -> None:
-    if not await asyncio.to_thread(reader.connect):
-        log.warning("%s reader failed to start — skipping.", name)
-        return
-
-    last_received = 0.0  # monotonic time of last successful rpm read
-    _STALE_TIMEOUT = 3.0  # seconds without data before resetting rpm_pct to 0
+    last_received_time = 0.0
+    _STALE_TIMEOUT = 2.5  # seconds
 
     while not state.shutdown_event.is_set():
-        pct = await asyncio.to_thread(reader.read_rpm_pct)
+        found_rpm = None
         now = time.monotonic()
-        if pct is not None:
+
+        for name, r in readers:
+            pct = await asyncio.to_thread(r.read_rpm_pct)
+            if pct is not None:
+                found_rpm = pct
+                break
+
+        if found_rpm is not None:
+            last_received_time = now
             state.mark_telemetry_received()
-            state.rpm_pct = pct
-            last_received = now
+            state.rpm_pct = found_rpm
         else:
-            # No data from this reader — if stale across all readers, reset to 0
-            if last_received > 0 and (now - last_received) > _STALE_TIMEOUT:
+            if last_received_time > 0.0 and (now - last_received_time) > _STALE_TIMEOUT:
                 state.rpm_pct = 0.0
 
         await asyncio.sleep(0.01)
 
-    await asyncio.to_thread(reader.disconnect)
-    log.info("%s reader stopped.", name)
+    for name, r in readers:
+        await asyncio.to_thread(r.disconnect)
+    log.info("Sim racing telemetry stopped.")
