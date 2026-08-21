@@ -137,8 +137,14 @@ class ACUDPReader:
 
             if is_limiter:
                 speed_kmh = struct.unpack_from("<f", latest_telem_pkt, 12)[0]
-                pit_speed_pct = max(0.0, min(1.2, speed_kmh / 60.0))
-                return (pit_speed_pct, True)
+                pit_limit = 60.0
+                window_start = pit_limit - 20.0
+                if speed_kmh > pit_limit:
+                    return (1.0 + min(1.0, (speed_kmh - pit_limit) / 20.0), True)
+                elif speed_kmh < window_start:
+                    return (0.0, True)
+                else:
+                    return ((speed_kmh - window_start) / (pit_limit - window_start), True)
 
             if engine_rpm > self._max_rpm_seen:
                 self._max_rpm_seen = float(engine_rpm)
@@ -294,11 +300,13 @@ class AMS2Reader:
                     # 2 = INGAME_PLAYING, 3 = INGAME_PAUSED, 4 = INGAME_INMENU_TIME_TICKING, 5 = INGAME_RESTARTING
                     if game_state in (2, 3, 4, 5):
                         # AMS2 / PCARS2 64-bit offsets:
+                        # 112:  mTrackLocation (uint32) -> 0=OFF_TRACK, 1=ON_TRACK, 2=PITLANE, 3=PIT_ENTRY, 4=PIT_EXIT
                         # 6816: mCarFlags (uint32) -> bit 3 (8) = CAR_PIT_LIMITER
                         # 6848: mSpeed (float m/s)
                         # 6852: mRpm (float)
                         # 6856: mMaxRPM (float)
                         # 7396: mPitMode (uint32) -> 1=DRIVING_INTO_PITS, 2=IN_PIT, 3=DRIVING_OUT_OF_PITS
+                        track_location = struct.unpack_from("<I", data, 112)[0] if len(data) >= 116 else 1
                         car_flags = struct.unpack_from("<I", data, 6816)[0]
                         speed_ms = struct.unpack_from("<f", data, 6848)[0]
                         rpm = struct.unpack_from("<f", data, 6852)[0]
@@ -313,7 +321,7 @@ class AMS2Reader:
                             pit_mode = 0
 
                         is_pit_limiter_on = bool(car_flags & 8)
-                        is_in_pit_lane = (pit_mode in (1, 2, 3))
+                        is_in_pit_lane = (track_location in (2, 3, 4)) or (pit_mode in (1, 2, 3))
                         is_pit_active = is_pit_limiter_on or is_in_pit_lane
 
                         if max_rpm > 1000.0:
@@ -323,8 +331,14 @@ class AMS2Reader:
 
                         if is_pit_active:
                             speed_kmh = speed_ms * 3.6
-                            pit_speed_pct = max(0.0, min(1.2, speed_kmh / 60.0))
-                            return (pit_speed_pct, True)
+                            pit_limit = 60.0
+                            window_start = pit_limit - 20.0
+                            if speed_kmh > pit_limit:
+                                return (1.0 + min(1.0, (speed_kmh - pit_limit) / 20.0), True)
+                            elif speed_kmh < window_start:
+                                return (0.0, True)
+                            else:
+                                return ((speed_kmh - window_start) / (pit_limit - window_start), True)
 
                         if self._max_rpm_seen > 0:
                             return (max(0.0, min(1.0, rpm / self._max_rpm_seen)), False)

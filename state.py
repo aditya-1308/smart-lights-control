@@ -128,7 +128,7 @@ class SharedState:
 
     def set_telemetry(self, rpm_pct: float, is_limiter: bool = False) -> None:
         """Atomically set RPM percentage and pit limiter state."""
-        self._rpm_pct = max(0.0, min(1.2, float(rpm_pct)))
+        self._rpm_pct = max(0.0, min(2.0, float(rpm_pct)))
         self._is_limiter = bool(is_limiter)
         if self._rpm_pct > 0.0 or self._is_limiter:
             self._last_telemetry_time = time.monotonic()

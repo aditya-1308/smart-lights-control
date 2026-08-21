@@ -50,10 +50,22 @@ _EMERALD: RGB = (0, 255, 120)
 
 
 def _build_rev_meter_array(rpm_pct: float, is_limiter: bool, flash_phase: bool) -> List[RGB]:
-    # Case 1: Pit Limiter / Pit Lane Speed Guide -> Solid Speedometer (no flashing)
+    # Case 1: Pit Limiter / Pit Lane Speed Guide -> Solid Speedometer (smooth overspeed fade)
     if is_limiter:
-        if rpm_pct > 1.02:
-            return [_RED] * config.LIGHTBAR_TOTAL  # Solid Red on overspeeding
+        if rpm_pct > 1.0:
+            over_t = max(0.0, min(1.0, rpm_pct - 1.0))
+            if over_t < 0.5:
+                u = over_t / 0.5
+                cr = int(u * 255)
+                cg = int(255 - u * 55)
+                cb = int(100 * (1.0 - u))
+            else:
+                u = (over_t - 0.5) / 0.5
+                cr = 255
+                cg = int(200 * (1.0 - u))
+                cb = 0
+            return [(cr, cg, cb)] * config.LIGHTBAR_TOTAL
+
         colors = [_OFF] * config.LIGHTBAR_TOTAL
         speed_norm = max(0.0, min(1.0, rpm_pct))
         half = config.LIGHTBAR_TOTAL // 2

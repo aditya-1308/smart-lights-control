@@ -383,11 +383,20 @@ public:
         }
 
         int rpms = m_physicsData->rpms;
-        out_limiter = (m_physicsData->pitLimiterOn != 0);
+        bool in_pit_lane = (m_physicsData->pitLimiterOn != 0);
+        out_limiter = in_pit_lane;
 
         if (out_limiter) {
             float speed_kmh = m_physicsData->speedKmh;
-            out_pct = max(0.0f, min(1.2f, speed_kmh / 60.0f));
+            float pit_limit = 60.0f;
+            float window_start = pit_limit - 20.0f; // 40 km/h
+            if (speed_kmh > pit_limit) {
+                out_pct = 1.0f + min(1.0f, (speed_kmh - pit_limit) / 20.0f);
+            } else if (speed_kmh < window_start) {
+                out_pct = 0.0f;
+            } else {
+                out_pct = (speed_kmh - window_start) / (pit_limit - window_start);
+            }
             return true;
         }
 
@@ -473,9 +482,23 @@ static void render_rev_meter(std::vector<uint8_t>& pkt, const HardwareLayout& hw
 
     // Case 1: Pit Limiter / Pit Lane Speed Guide
     if (is_limiter) {
-        // If overspeeding in pit lane (> 102% pit speed limit), turn solid RED (no flashing)
-        if (rpm_pct > 1.02f) {
-            uint8_t cr = 255, cg = 0, cb = 0;
+        // Subcase A: Overspeeding above pit speed limit (rpm_pct > 1.0)
+        // Smoothly fades all LEDs: Green (at 1.0 / 60 km/h) -> Yellow -> Orange -> Pure Red (at >= 2.0 / 85+ km/h)
+        if (rpm_pct > 1.0f) {
+            float over_t = max(0.0f, min(1.0f, rpm_pct - 1.0f));
+            uint8_t cr, cg, cb;
+            if (over_t < 0.5f) {
+                float u = over_t / 0.5f;
+                cr = (uint8_t)(u * 255.0f);
+                cg = (uint8_t)(255.0f - u * 55.0f);
+                cb = (uint8_t)(100.0f * (1.0f - u));
+            } else {
+                float u = (over_t - 0.5f) / 0.5f;
+                cr = 255;
+                cg = (uint8_t)(200.0f * (1.0f - u));
+                cb = 0;
+            }
+
             if (hw.seg1_start >= 0 && hw.seg2_start >= 0) {
                 for (int i = 0; i < hw.seg1_count; i++) set_led(hw.seg1_start + i, cr, cg, cb);
                 for (int i = 0; i < hw.seg2_count; i++) set_led(hw.seg2_start + i, cr, cg, cb);
