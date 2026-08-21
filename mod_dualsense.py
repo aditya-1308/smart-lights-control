@@ -1,17 +1,20 @@
 """
 mod_dualsense.py - Dynamic Virtual DS4 controller + lightbar interception.
 
-Auto-detects when ANY game (PlayStation PC ports, Steam, Epic, EA, Ubisoft, Xbox, etc.)
-is launched and dynamically attaches the virtual DS4 controller.
+Auto-detects when ANY PlayStation PC port or lightbar-supported game is launched
+and dynamically attaches the virtual DS4 controller.
 
-When the game closes, it automatically detaches the virtual DS4 so your
-Xbox controller / physical controller remains completely uninterrupted.
+CRITICAL: When ANY Sim Racing game (Assetto Corsa, F1, AMS2, Forza, iRacing, rFactor,
+Le Mans Ultimate, WRC, BeamNG, etc.) or its companion launchers/tools are running,
+the virtual DS4 controller is STRICTLY PREVENTED from attaching and is immediately
+detached so physical Xbox controllers and racing wheels work uninterrupted.
 """
 
 import asyncio
 import ctypes
 import ctypes.wintypes
 import logging
+import mmap
 import time
 from ctypes import (
     CDLL, CFUNCTYPE, POINTER, Structure,
@@ -38,37 +41,102 @@ from state import state
 
 log = logging.getLogger("dualsense")
 
-# Sim racing games that use dedicated UDP / Shared Memory telemetry (NEVER attach virtual DS4)
+# ===========================================================================
+# Sim racing games & launchers (NEVER attach virtual DS4)
+# ===========================================================================
 _SIM_RACING_GAMES: Set[str] = {
+    # Assetto Corsa & Content Manager
     "acs.exe",
+    "acs_x86.exe",
+    "acs_pro.exe",
     "assettocorsa.exe",
-    "f1_2022.exe",
-    "f1_2023.exe",
-    "f1_2024.exe",
-    "f1_2025.exe",
-    "f1_23.exe",
-    "f1_24.exe",
-    "f1_25.exe",
-    "f1.exe",
-    "ams2avx.exe",
-    "ams2.exe",
-    "forzahorizon5.exe",
-    "forzamotorsport.exe",
-    "forzahorizon4.exe",
-    "forzamotorsport7.exe",
-    "iracingsim64dx11.exe",
-    "iracingsim64.exe",
+    "assetto_corsa.exe",
+    "contentmanager.exe",
+    "content manager.exe",
+    "acmanager.exe",
+    "ac_launcher.exe",
     "acc.exe",
-    "rfactor2.exe",
-    "lemansultimate.exe",
-    "dirt2_game.exe",
-    "dirt4.exe",
-    "dirtrally2.exe",
-    "eawrc.exe",
-    "wrc.exe",
-    "beamng.drive.x64.exe",
-    "beamng.drive.exe",
+    "accserver.exe",
+    "assettocorsacompetizione.exe",
+    "acc-win64-shipping.exe",
+    "assettocorsaevo.exe",
+    "assettocorsaevo-win64-shipping.exe",
+    "ace.exe",
+    "ac2.exe",
+
+    # F1 Series (EA Sports / Codemasters 2018 - 2026+)
+    "f1_2018.exe", "f1_2019.exe", "f1_2020.exe", "f1_2021.exe",
+    "f1_2022.exe", "f1_2023.exe", "f1_2024.exe", "f1_2025.exe", "f1_2026.exe",
+    "f12018.exe", "f12019.exe", "f12020.exe", "f12021.exe",
+    "f12022.exe", "f12023.exe", "f12024.exe", "f12025.exe", "f12026.exe",
+    "f1_18.exe", "f1_19.exe", "f1_20.exe", "f1_21.exe",
+    "f1_22.exe", "f1_23.exe", "f1_24.exe", "f1_25.exe", "f1_26.exe",
+    "f122.exe", "f123.exe", "f124.exe", "f125.exe", "f126.exe",
+    "f1.exe",
+
+    # Automobilista & Project CARS
+    "ams2avx.exe", "ams2.exe", "automobilista2.exe",
+    "ams.exe", "automobilista.exe",
+    "pcars.exe", "pcars64.exe", "pcars2.exe", "pcars2avx.exe", "pcars3.exe", "pcars3avx.exe",
+
+    # Forza Horizon & Motorsport
+    "forzahorizon5.exe", "forzahorizon4.exe", "forzahorizon3.exe",
+    "forzamotorsport.exe", "forzamotorsport7.exe", "forzamotorsport6.exe",
+    "forza_gaming.desktop.x64_release_final.exe",
+
+    # iRacing
+    "iracingsim64dx11.exe", "iracingsim64.exe", "iracingsim.exe", "iracingsim32.exe",
+    "iracingui.exe", "iracingsim64directx11.exe", "iracingservice.exe",
+
+    # rFactor & Le Mans Ultimate
+    "rfactor2.exe", "rfactor.exe", "rfactor2dedicated.exe", "rfactor 2.exe",
+    "lemansultimate.exe", "lmu.exe", "lemansultimate_x64.exe",
+
+    # DiRT & WRC Rally Series
+    "dirtrally2.exe", "dirt_rally_2.exe", "dirtrally.exe", "dirt_rally.exe",
+    "dirt2_game.exe", "dirt3_game.exe", "dirt4.exe", "dirt5.exe", "dirt 5.exe",
+    "eawrc.exe", "wrc.exe", "wrc23.exe", "wrc24.exe", "wrc10.exe", "wrc9.exe", "wrc8.exe", "wrc7.exe",
+    "wrcgenerations.exe", "wrc generations.exe",
+    "richardburnsrally_sse.exe", "richardburnsrally.exe", "richard burns rally.exe", "rbr.exe",
+    "rallysimfans.exe", "rsfrbr.exe",
+    "dakardesertrally.exe", "dakardesertrally-win64-shipping.exe", "dakar.exe",
+
+    # Physics Sims & Others
+    "beamng.drive.x64.exe", "beamng.drive.exe", "beamng.drive.x86.exe", "beamng.drive.directx11.x64.exe",
+    "raceroom.exe", "raceroom64.exe", "rrre.exe", "rrre64.exe",
+    "kartkraft.exe", "kartkraft-win64-shipping.exe",
+    "lfs.exe", "liveforspeed.exe", "kartsim.exe",
+
+    # Sim Hardware / Companion Tools
+    "simhub.exe", "simhubwpf.exe",
+    "fanatec_control_panel.exe", "fanalab.exe",
+    "moza pit house.exe", "mozapithouse.exe",
+    "truedrive.exe", "simucube.exe",
+    "thrustmaster.exe", "tmcontrolpanel.exe",
 }
+
+# Window title keywords to identify sim racing games even with custom / modded exes
+_SIM_RACING_TITLE_KEYWORDS = (
+    "assetto corsa",
+    "content manager",
+    "automobilista",
+    "project cars",
+    "iracing",
+    "forza motorsport",
+    "forza horizon",
+    "rfactor",
+    "le mans ultimate",
+    "dirt rally",
+    "ea sports wrc",
+    "beamng",
+    "raceroom",
+    "richard burns rally",
+    "rallysimfans",
+    "live for speed",
+    "kartkraft",
+    "f1 20",
+    "f1 22", "f1 23", "f1 24", "f1 25", "f1 26",
+)
 
 # Known game executables with native DualShock 4 / DualSense lightbar or controller support
 _KNOWN_GAMES: Set[str] = {
@@ -251,13 +319,9 @@ class PROCESSENTRY32(ctypes.Structure):
     ]
 
 
-def is_game_running() -> bool:
-    """
-    Check if any game is currently running:
-    1. Checks all active background processes against known game database.
-    2. Inspects foreground window process to detect any newly released or unlisted game.
-    """
-    # 1. Check process snapshot
+def _get_running_processes() -> Set[str]:
+    """Capture a snapshot of all active process executable names (lowercase)."""
+    running = set()
     TH32CS_SNAPPROCESS = 0x00000002
     kernel32 = ctypes.windll.kernel32
     h_snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -266,19 +330,97 @@ def is_game_running() -> bool:
         pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
         if kernel32.Process32First(h_snapshot, ctypes.byref(pe)):
             while True:
-                exe_name = pe.szExeFile.decode("utf-8", errors="ignore").lower()
-                # Never attach virtual DS4 if a sim racing game is running
-                if exe_name in _SIM_RACING_GAMES:
-                    kernel32.CloseHandle(h_snapshot)
-                    return False
-                if exe_name in _KNOWN_GAMES:
-                    kernel32.CloseHandle(h_snapshot)
-                    return True
+                exe = pe.szExeFile.decode("utf-8", errors="ignore").lower().strip()
+                if exe:
+                    running.add(exe)
                 if not kernel32.Process32Next(h_snapshot, ctypes.byref(pe)):
                     break
         kernel32.CloseHandle(h_snapshot)
+    return running
 
-    # 2. Check foreground window
+
+def is_sim_racing_running() -> bool:
+    """
+    Comprehensive multi-layer check for ANY sim racing game or launcher:
+    1. Active telemetry stream (state.is_telemetry_active) or live RPM.
+    2. Shared memory active session check (Assetto Corsa acpmf_physics, AMS2 $pcars2$).
+    3. Process snapshot matching any sim racing game / launcher.
+    4. Foreground window executable or window title matching sim racing keywords.
+    """
+    # 1. Telemetry stream check
+    if state.is_telemetry_active(5.0) or state.rpm_pct > 0.0:
+        return True
+
+    # 2. Assetto Corsa Shared Memory check (instant detection even if telemetry reader is lagging)
+    try:
+        shm_ac = mmap.mmap(-1, 256, "acpmf_physics")
+        shm_ac.seek(0)
+        data = shm_ac.read(24)
+        if len(data) >= 24:
+            packet_id = int.from_bytes(data[0:4], byteorder="little", signed=True)
+            rpms = int.from_bytes(data[20:24], byteorder="little", signed=True)
+            shm_ac.close()
+            if packet_id > 0 and rpms > 0:
+                return True
+        else:
+            shm_ac.close()
+    except Exception:
+        pass
+
+    # 3. Process snapshot check
+    running_procs = _get_running_processes()
+    if running_procs.intersection(_SIM_RACING_GAMES):
+        return True
+
+    # 4. Foreground window check (exe name + title heuristics)
+    if PYWIN32_AVAILABLE:
+        try:
+            hwnd = win32gui.GetForegroundWindow()
+            if hwnd:
+                title = win32gui.GetWindowText(hwnd).strip().lower()
+                if title:
+                    for kw in _SIM_RACING_TITLE_KEYWORDS:
+                        if kw in title:
+                            return True
+
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid:
+                    kernel32 = ctypes.windll.kernel32
+                    h_proc = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+                    if h_proc:
+                        buf = (ctypes.c_char * 260)()
+                        size = ctypes.wintypes.DWORD(260)
+                        if kernel32.QueryFullProcessImageNameA(h_proc, 0, buf, ctypes.byref(size)):
+                            exe = buf.value.decode("utf-8", errors="ignore").split("\\")[-1].lower()
+                            kernel32.CloseHandle(h_proc)
+                            if exe in _SIM_RACING_GAMES:
+                                return True
+                        else:
+                            kernel32.CloseHandle(h_proc)
+        except Exception:
+            pass
+
+    return False
+
+
+def is_game_running() -> bool:
+    """
+    Check if any non-sim game is currently running:
+    1. Returns False immediately if any sim racing game / launcher is running.
+    2. Checks process snapshot against known games.
+    3. Inspects foreground window process.
+    """
+    # Strict sim racing exclusion first
+    if is_sim_racing_running():
+        return False
+
+    running_procs = _get_running_processes()
+
+    # If any known game executable is running
+    if running_procs.intersection(_KNOWN_GAMES):
+        return True
+
+    # Check foreground window
     if PYWIN32_AVAILABLE:
         try:
             hwnd = win32gui.GetForegroundWindow()
@@ -287,7 +429,8 @@ def is_game_running() -> bool:
                 if title:
                     _, pid = win32process.GetWindowThreadProcessId(hwnd)
                     if pid:
-                        h_proc = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+                        kernel32 = ctypes.windll.kernel32
+                        h_proc = kernel32.OpenProcess(0x1000, False, pid)
                         if h_proc:
                             buf = (ctypes.c_char * 260)()
                             size = ctypes.wintypes.DWORD(260)
@@ -456,19 +599,22 @@ class VirtualDS4Controller:
 async def run(controller: VirtualDS4Controller) -> None:
     """
     Supervises the DS4 controller:
-    - Auto-starts when any game is launched.
-    - Auto-stops after confirmed game exit (debounced to prevent connect/disconnect loops).
+    - Automatically attaches when non-sim games start.
+    - Strictly prevents attachment and immediately detaches during ANY sim racing game / launcher.
+    - Auto-stops after confirmed game exit.
     """
-    log.info("DS4 auto-detector running (auto-detects all games)...")
+    log.info("DS4 auto-detector running (auto-detects all games with sim racing protection)...")
 
     consecutive_inactive = 0
-    # 4 consecutive checks * 1.5s = 6.0s sustained inactivity before detaching
     INACTIVE_DEBOUNCE_TICKS = 4
 
     while not state.shutdown_event.is_set():
-        # If sim racing telemetry is active, detach DS4 controller and clear lightbar
-        if state.is_telemetry_active(5.0) or state.rpm_pct > 0.0:
+        # If any sim racing game / launcher / telemetry / shared memory is active, detach virtual DS4 immediately
+        sim_racing_active = is_sim_racing_running()
+
+        if sim_racing_active:
             if controller.is_active:
+                log.info("Sim racing game detected -> detaching virtual DS4 immediately.")
                 await asyncio.to_thread(controller.stop)
             state.set_lightbar_rgb(0, 0, 0)
             consecutive_inactive = INACTIVE_DEBOUNCE_TICKS
@@ -492,4 +638,5 @@ async def run(controller: VirtualDS4Controller) -> None:
 
     await asyncio.to_thread(controller.stop)
     log.info("DS4 module stopped.")
+
 
