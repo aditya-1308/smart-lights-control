@@ -38,6 +38,38 @@ from state import state
 
 log = logging.getLogger("dualsense")
 
+# Sim racing games that use dedicated UDP / Shared Memory telemetry (NEVER attach virtual DS4)
+_SIM_RACING_GAMES: Set[str] = {
+    "acs.exe",
+    "assettocorsa.exe",
+    "f1_2022.exe",
+    "f1_2023.exe",
+    "f1_2024.exe",
+    "f1_2025.exe",
+    "f1_23.exe",
+    "f1_24.exe",
+    "f1_25.exe",
+    "f1.exe",
+    "ams2avx.exe",
+    "ams2.exe",
+    "forzahorizon5.exe",
+    "forzamotorsport.exe",
+    "forzahorizon4.exe",
+    "forzamotorsport7.exe",
+    "iracingsim64dx11.exe",
+    "iracingsim64.exe",
+    "acc.exe",
+    "rfactor2.exe",
+    "lemansultimate.exe",
+    "dirt2_game.exe",
+    "dirt4.exe",
+    "dirtrally2.exe",
+    "eawrc.exe",
+    "wrc.exe",
+    "beamng.drive.x64.exe",
+    "beamng.drive.exe",
+}
+
 # Known game executables with native DualShock 4 / DualSense lightbar or controller support
 _KNOWN_GAMES: Set[str] = {
     # Sony PlayStation PC ports
@@ -88,15 +120,7 @@ _KNOWN_GAMES: Set[str] = {
     "thecrew-motorfest.exe",
     "avatar_fop.exe",
 
-    # EA / Sim / Racing / Sports
-    "f1_2022.exe",
-    "f1_2023.exe",
-    "f1_2024.exe",
-    "f1_2025.exe",
-    "f1_23.exe",
-    "f1_24.exe",
-    "f1_25.exe",
-    "f1.exe",
+    # EA / Sports / Action
     "fc24.exe",
     "fc25.exe",
     "fifa23.exe",
@@ -243,6 +267,10 @@ def is_game_running() -> bool:
         if kernel32.Process32First(h_snapshot, ctypes.byref(pe)):
             while True:
                 exe_name = pe.szExeFile.decode("utf-8", errors="ignore").lower()
+                # Never attach virtual DS4 if a sim racing game is running
+                if exe_name in _SIM_RACING_GAMES:
+                    kernel32.CloseHandle(h_snapshot)
+                    return False
                 if exe_name in _KNOWN_GAMES:
                     kernel32.CloseHandle(h_snapshot)
                     return True
@@ -266,7 +294,7 @@ def is_game_running() -> bool:
                             if kernel32.QueryFullProcessImageNameA(h_proc, 0, buf, ctypes.byref(size)):
                                 exe = buf.value.decode("utf-8", errors="ignore").split("\\")[-1].lower()
                                 kernel32.CloseHandle(h_proc)
-                                if exe and exe not in _IGNORED_PROCESSES:
+                                if exe and exe not in _IGNORED_PROCESSES and exe not in _SIM_RACING_GAMES:
                                     return True
                             else:
                                 kernel32.CloseHandle(h_proc)
@@ -438,6 +466,15 @@ async def run(controller: VirtualDS4Controller) -> None:
     INACTIVE_DEBOUNCE_TICKS = 4
 
     while not state.shutdown_event.is_set():
+        # If sim racing telemetry is active, detach DS4 controller and clear lightbar
+        if state.is_telemetry_active(5.0) or state.rpm_pct > 0.0:
+            if controller.is_active:
+                await asyncio.to_thread(controller.stop)
+            state.set_lightbar_rgb(0, 0, 0)
+            consecutive_inactive = INACTIVE_DEBOUNCE_TICKS
+            await asyncio.sleep(0.5)
+            continue
+
         game_active = await asyncio.to_thread(is_game_running)
 
         should_attach = config.ENABLE_VIRTUAL_DS4 or (config.ENABLE_VIRTUAL_DS4_AUTO and game_active)

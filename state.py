@@ -67,6 +67,7 @@ class SharedState:
 
         # -- Rev meter --
         self._rpm_pct: float = 0.0  # 0.0 – 1.0
+        self._last_telemetry_time: float = 0.0  # time.monotonic()
 
         # -- Context --
         self.context: AppContext = AppContext.IDLE
@@ -115,11 +116,23 @@ class SharedState:
     @rpm_pct.setter
     def rpm_pct(self, val: float) -> None:
         self._rpm_pct = max(0.0, min(1.0, float(val)))
+        if self._rpm_pct > 0.0:
+            self._last_telemetry_time = time.monotonic()
         try:
             from ipc_bridge import ipc_bridge
             ipc_bridge.update_telemetry(self._rpm_pct)
         except Exception:
             pass
+
+    def mark_telemetry_received(self) -> None:
+        """Record that a sim racing telemetry packet was received."""
+        self._last_telemetry_time = time.monotonic()
+
+    def is_telemetry_active(self, timeout: float = 5.0) -> bool:
+        """True if sim racing telemetry has arrived within ``timeout`` seconds."""
+        if self._last_telemetry_time == 0.0:
+            return False
+        return (time.monotonic() - self._last_telemetry_time) < timeout
 
     def set_discovered_segments(self, seg_dict: dict) -> None:
         """Store discovered segment metadata from WLED."""
@@ -135,11 +148,12 @@ class SharedState:
         with self._thread_lock:
             self._lightbar_rgb = (r, g, b)
             self._lightbar_last_update = time.monotonic()
-            try:
-                from ipc_bridge import ipc_bridge
-                ipc_bridge.update_ds4_color(r, g, b)
-            except Exception:
-                pass
+            if not self.is_telemetry_active(5.0):
+                try:
+                    from ipc_bridge import ipc_bridge
+                    ipc_bridge.update_ds4_color(r, g, b)
+                except Exception:
+                    pass
 
     def get_lightbar_rgb(self) -> Tuple[int, int, int]:
         """Read the most recent DS4 lightbar color (lock-free read)."""

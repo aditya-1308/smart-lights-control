@@ -454,7 +454,8 @@ static void render_rev_meter(std::vector<uint8_t>& pkt, const HardwareLayout& hw
     const float REV_FULL_PCT  = 0.95f;
     const float REV_LIMIT_PCT = 0.96f;
 
-    uint8_t flash_r = 0, flash_g = 100, flash_b = 255;
+    // F1 / Motorsport standard shift light flash (Magenta / Purple)
+    uint8_t flash_r = 255, flash_g = 0, flash_b = 255;
 
     // Helper lambda to set physical LED color
     auto set_led = [&](int physical_idx, uint8_t r, uint8_t g, uint8_t b) {
@@ -728,7 +729,7 @@ int main(int argc, char* argv[]) {
         if (ac_active && ac_rpm > 0.0f) {
             // Priority 1: Assetto Corsa Native Shared Memory
             render_rev_meter(pkt, hw, ac_rpm, ac_limiter, flash_state);
-        } else if (ipc && ipc->lightbar_mode == 1 && ipc->rpm_pct > 0.0f) {
+        } else if (ipc && (ipc->lightbar_mode == 1 || ipc->rpm_pct > 0.0f)) {
             // Priority 2: Universal Sim Racing Telemetry (F1, AMS2, Forza, iRacing) via IPC
             render_rev_meter(pkt, hw, ipc->rpm_pct, ipc->is_limiter != 0, flash_state);
         } else if (ipc && ipc->lightbar_mode == 2 && (ipc->ds4_r + ipc->ds4_g + ipc->ds4_b) > 0) {

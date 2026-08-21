@@ -154,6 +154,9 @@ class LightbarRenderer:
                 from ipc_bridge import ipc_bridge
                 if mode in (LightbarMode.CS2_FLASH, LightbarMode.CS2_PULSE):
                     ipc_bridge.update_raw_lightbar(color_array[:17], color_array[17:])
+                elif mode == LightbarMode.REV_METER:
+                    rpm = state.rpm_pct
+                    ipc_bridge.update_telemetry(rpm, rpm >= config.REV_LIMITER_PCT)
                 elif mode == LightbarMode.DS4_ACTIVE:
                     r, g, b = state.get_lightbar_rgb()
                     ipc_bridge.update_ds4_color(r, g, b)
@@ -169,19 +172,15 @@ class LightbarRenderer:
         if mode in (LightbarMode.CS2_FLASH, LightbarMode.CS2_PULSE):
             return
 
-        ds4_on = state.is_ds4_active()
-        # REV_METER activates for ANY positive rpm from telemetry.
-        # rpm_pct > 0 means a sim racing game is actively sending data.
-        # The visual bar itself only lights up above REV_START_PCT — this is just
-        # the mode gate so the lightbar is owned by the rev meter while in a session.
-        racing = state.rpm_pct > 0.0
+        racing = state.is_telemetry_active(5.0) or state.rpm_pct > 0.0
+        ds4_on = state.is_ds4_active() and not racing
 
-        if ds4_on:
-            if mode != LightbarMode.DS4_ACTIVE:
-                await state.set_mode(LightbarMode.DS4_ACTIVE)
-        elif racing:
+        if racing:
             if mode != LightbarMode.REV_METER:
                 await state.set_mode(LightbarMode.REV_METER)
+        elif ds4_on:
+            if mode != LightbarMode.DS4_ACTIVE:
+                await state.set_mode(LightbarMode.DS4_ACTIVE)
         else:
             if mode != LightbarMode.IDLE:
                 await state.set_mode(LightbarMode.IDLE)
