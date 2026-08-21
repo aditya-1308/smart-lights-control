@@ -67,6 +67,7 @@ class SharedState:
 
         # -- Rev meter --
         self._rpm_pct: float = 0.0  # 0.0 – 1.0
+        self._is_limiter: bool = False
         self._last_telemetry_time: float = 0.0  # time.monotonic()
 
         # -- Context --
@@ -115,12 +116,25 @@ class SharedState:
 
     @rpm_pct.setter
     def rpm_pct(self, val: float) -> None:
-        self._rpm_pct = max(0.0, min(1.0, float(val)))
-        if self._rpm_pct > 0.0:
+        self.set_telemetry(val, self._is_limiter)
+
+    @property
+    def is_limiter(self) -> bool:
+        return self._is_limiter
+
+    @is_limiter.setter
+    def is_limiter(self, val: bool) -> None:
+        self._is_limiter = bool(val)
+
+    def set_telemetry(self, rpm_pct: float, is_limiter: bool = False) -> None:
+        """Atomically set RPM percentage and pit limiter state."""
+        self._rpm_pct = max(0.0, min(1.2, float(rpm_pct)))
+        self._is_limiter = bool(is_limiter)
+        if self._rpm_pct > 0.0 or self._is_limiter:
             self._last_telemetry_time = time.monotonic()
         try:
             from ipc_bridge import ipc_bridge
-            ipc_bridge.update_telemetry(self._rpm_pct)
+            ipc_bridge.update_telemetry(self._rpm_pct, self._is_limiter)
         except Exception:
             pass
 

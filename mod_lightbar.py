@@ -44,9 +44,30 @@ for _p in range(config.LIGHTBAR_TOTAL):
         _ZONE_COLORS.append(_RED)
 
 
-def _build_rev_meter_array(rpm_pct: float, flash_blue: bool) -> List[RGB]:
-    if flash_blue:
-        return [_BLUE] * config.LIGHTBAR_TOTAL
+_PURPLE: RGB = (255, 0, 255)
+_CYAN:   RGB = (0, 220, 255)
+_EMERALD: RGB = (0, 255, 120)
+
+
+def _build_rev_meter_array(rpm_pct: float, is_limiter: bool, flash_phase: bool) -> List[RGB]:
+    # Case 1: Pit Limiter / Pit Lane Speed Guide -> Solid Speedometer (no flashing)
+    if is_limiter:
+        if rpm_pct > 1.02:
+            return [_RED] * config.LIGHTBAR_TOTAL  # Solid Red on overspeeding
+        colors = [_OFF] * config.LIGHTBAR_TOTAL
+        speed_norm = max(0.0, min(1.0, rpm_pct))
+        half = config.LIGHTBAR_TOTAL // 2
+        lit_per_side = round(speed_norm * half)
+        for i in range(min(lit_per_side, config.SEG1_COUNT)):
+            colors[i] = _CYAN if i < (config.SEG1_COUNT // 2) else _EMERALD
+        for i in range(min(lit_per_side, config.SEG2_COUNT)):
+            pos = config.LIGHTBAR_TOTAL - 1 - i
+            colors[pos] = _CYAN if i < (config.SEG2_COUNT // 2) else _EMERALD
+        return colors
+
+    # Case 2: Engine Shift Light Flash (Magenta/Purple)
+    if rpm_pct >= config.REV_LIMITER_PCT:
+        return [_PURPLE if flash_phase else _OFF] * config.LIGHTBAR_TOTAL
 
     colors = [_OFF] * config.LIGHTBAR_TOTAL
     if rpm_pct < config.REV_START_PCT:
@@ -133,15 +154,16 @@ class LightbarRenderer:
 
         elif mode == LightbarMode.REV_METER:
             rpm = state.rpm_pct
+            is_lim = state.is_limiter
             now = time.monotonic()
-            if rpm >= config.REV_LIMITER_PCT:
+            if rpm >= config.REV_LIMITER_PCT or (is_lim and rpm > 1.02):
                 if now - self._last_flash_toggle >= self._flash_interval:
                     self._flash_phase = not self._flash_phase
                     self._last_flash_toggle = now
-                color_array = _build_rev_meter_array(rpm, flash_blue=self._flash_phase)
             else:
                 self._flash_phase = False
-                color_array = _build_rev_meter_array(rpm, flash_blue=False)
+
+            color_array = _build_rev_meter_array(rpm, is_lim, self._flash_phase)
 
         else:  # IDLE
             color_array = [_OFF] * config.LIGHTBAR_TOTAL
@@ -155,8 +177,7 @@ class LightbarRenderer:
                 if mode in (LightbarMode.CS2_FLASH, LightbarMode.CS2_PULSE):
                     ipc_bridge.update_raw_lightbar(color_array[:17], color_array[17:])
                 elif mode == LightbarMode.REV_METER:
-                    rpm = state.rpm_pct
-                    ipc_bridge.update_telemetry(rpm, rpm >= config.REV_LIMITER_PCT)
+                    ipc_bridge.update_telemetry(state.rpm_pct, state.is_limiter)
                 elif mode == LightbarMode.DS4_ACTIVE:
                     r, g, b = state.get_lightbar_rgb()
                     ipc_bridge.update_ds4_color(r, g, b)

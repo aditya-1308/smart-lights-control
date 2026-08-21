@@ -20,7 +20,7 @@ import logging
 import socket
 import struct
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import config
 from state import state
@@ -127,21 +127,23 @@ class ACUDPReader:
             return None
 
         try:
-            is_limiter = latest_telem_pkt[29] if len(latest_telem_pkt) > 29 else 0
+            is_limiter = bool(latest_telem_pkt[29]) if len(latest_telem_pkt) > 29 else False
             engine_rpm = struct.unpack_from("<f", latest_telem_pkt, 72)[0]
 
-            if engine_rpm <= 0.0:
-                return 0.0
+            if engine_rpm <= 0.0 and not is_limiter:
+                return (0.0, False)
 
             self._last_received = now
+
+            if is_limiter:
+                speed_kmh = struct.unpack_from("<f", latest_telem_pkt, 12)[0]
+                pit_speed_pct = max(0.0, min(1.2, speed_kmh / 60.0))
+                return (pit_speed_pct, True)
 
             if engine_rpm > self._max_rpm_seen:
                 self._max_rpm_seen = float(engine_rpm)
 
-            if is_limiter:
-                return 1.0
-
-            return max(0.0, min(1.0, engine_rpm / self._max_rpm_seen))
+            return (max(0.0, min(1.0, engine_rpm / self._max_rpm_seen)), False)
         except Exception:
             return None
 
@@ -173,7 +175,7 @@ class F1Reader:
             self._sock.close()
             self._sock = None
 
-    def read_rpm_pct(self) -> Optional[float]:
+    def read_rpm_pct(self) -> Optional[Tuple[float, bool]]:
         if not self._sock:
             return None
 
@@ -212,7 +214,7 @@ class F1Reader:
         rev_lights_pct = latest_telem_pkt[car_offset + 19]
 
         if engine_rpm <= 0:
-            return 0.0
+            return (0.0, False)
 
         if engine_rpm > self._max_rpm_seen:
             self._max_rpm_seen = float(engine_rpm)
@@ -220,9 +222,9 @@ class F1Reader:
         # F1 rev lights: rev_lights_pct gives exact steering wheel LED fill (0-100%)
         if rev_lights_pct > 0:
             norm = min(1.0, float(rev_lights_pct) / 100.0)
-            return 0.65 + norm * 0.35
+            return (0.65 + norm * 0.35, False)
         else:
-            return max(0.0, min(0.64, float(engine_rpm) / self._max_rpm_seen * 0.65))
+            return (max(0.0, min(0.64, float(engine_rpm) / self._max_rpm_seen * 0.65)), False)
 
 
 # ===========================================================================
@@ -272,7 +274,7 @@ class AMS2Reader:
                 pass
             self._sock = None
 
-    def read_rpm_pct(self) -> Optional[float]:
+    def read_rpm_pct(self) -> Optional[Tuple[float, bool]]:
         # 1. Read from Shared Memory ($pcars2$)
         if not self._shm:
             import mmap as mmap_mod
@@ -291,20 +293,41 @@ class AMS2Reader:
                     game_state = struct.unpack_from("<I", data, 8)[0]
                     # 2 = INGAME_PLAYING, 3 = INGAME_PAUSED, 4 = INGAME_INMENU_TIME_TICKING, 5 = INGAME_RESTARTING
                     if game_state in (2, 3, 4, 5):
-                        # AMS2 / PCARS2 64-bit offsets: 6852 (RPM), 6856 (MaxRPM)
+                        # AMS2 / PCARS2 64-bit offsets:
+                        # 6816: mCarFlags (uint32) -> bit 3 (8) = CAR_PIT_LIMITER
+                        # 6848: mSpeed (float m/s)
+                        # 6852: mRpm (float)
+                        # 6856: mMaxRPM (float)
+                        # 7396: mPitMode (uint32) -> 1=DRIVING_INTO_PITS, 2=IN_PIT, 3=DRIVING_OUT_OF_PITS
+                        car_flags = struct.unpack_from("<I", data, 6816)[0]
+                        speed_ms = struct.unpack_from("<f", data, 6848)[0]
                         rpm = struct.unpack_from("<f", data, 6852)[0]
                         max_rpm = struct.unpack_from("<f", data, 6856)[0]
+                        pit_mode = struct.unpack_from("<I", data, 7396)[0] if len(data) >= 7400 else 0
+
                         if max_rpm < 500.0 or max_rpm > 30000.0:
+                            car_flags = struct.unpack_from("<I", data, 3628)[0]
+                            speed_ms = struct.unpack_from("<f", data, 3660)[0]
                             rpm = struct.unpack_from("<f", data, 3664)[0]
                             max_rpm = struct.unpack_from("<f", data, 3668)[0]
+                            pit_mode = 0
+
+                        is_pit_limiter_on = bool(car_flags & 8)
+                        is_in_pit_lane = (pit_mode in (1, 2, 3))
+                        is_pit_active = is_pit_limiter_on or is_in_pit_lane
 
                         if max_rpm > 1000.0:
                             self._max_rpm_seen = max_rpm
                         elif rpm > self._max_rpm_seen:
                             self._max_rpm_seen = rpm
 
+                        if is_pit_active:
+                            speed_kmh = speed_ms * 3.6
+                            pit_speed_pct = max(0.0, min(1.2, speed_kmh / 60.0))
+                            return (pit_speed_pct, True)
+
                         if self._max_rpm_seen > 0:
-                            return max(0.0, min(1.0, rpm / self._max_rpm_seen))
+                            return (max(0.0, min(1.0, rpm / self._max_rpm_seen)), False)
             except Exception:
                 self.disconnect()
 
@@ -337,7 +360,7 @@ class AMS2Reader:
         if self._max_rpm_seen <= 0:
             return None
 
-        return max(0.0, min(1.0, float(rpm) / self._max_rpm_seen))
+        return (max(0.0, min(1.0, float(rpm) / self._max_rpm_seen)), False)
 
 
 # ===========================================================================
@@ -367,7 +390,7 @@ class ForzaReader:
             self._sock.close()
             self._sock = None
 
-    def read_rpm_pct(self) -> Optional[float]:
+    def read_rpm_pct(self) -> Optional[Tuple[float, bool]]:
         if not self._sock:
             return None
 
@@ -385,13 +408,13 @@ class ForzaReader:
 
         is_race_on = struct.unpack_from("<i", latest_data, 0)[0]
         if is_race_on == 0:
-            return 0.0
+            return (0.0, False)
 
         max_rpm = struct.unpack_from("<f", latest_data, 8)[0]
         cur_rpm = struct.unpack_from("<f", latest_data, 16)[0]
         if max_rpm <= 100.0 or cur_rpm < 0.0:
-            return 0.0
-        return max(0.0, min(1.0, cur_rpm / max_rpm))
+            return (0.0, False)
+        return (max(0.0, min(1.0, cur_rpm / max_rpm)), False)
 
 
 # ===========================================================================
@@ -412,22 +435,23 @@ async def run() -> None:
     _STALE_TIMEOUT = 2.5  # seconds
 
     while not state.shutdown_event.is_set():
-        found_rpm = None
+        found_data = None
         now = time.monotonic()
 
         for name, r in readers:
-            pct = await asyncio.to_thread(r.read_rpm_pct)
-            if pct is not None:
-                found_rpm = pct
+            res = await asyncio.to_thread(r.read_rpm_pct)
+            if res is not None:
+                found_data = res
                 break
 
-        if found_rpm is not None:
+        if found_data is not None:
+            pct, is_limiter = found_data
             last_received_time = now
             state.mark_telemetry_received()
-            state.rpm_pct = found_rpm
+            state.set_telemetry(pct, is_limiter)
         else:
             if last_received_time > 0.0 and (now - last_received_time) > _STALE_TIMEOUT:
-                state.rpm_pct = 0.0
+                state.set_telemetry(0.0, False)
 
         await asyncio.sleep(0.01)
 

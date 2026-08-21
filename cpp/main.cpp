@@ -385,6 +385,12 @@ public:
         int rpms = m_physicsData->rpms;
         out_limiter = (m_physicsData->pitLimiterOn != 0);
 
+        if (out_limiter) {
+            float speed_kmh = m_physicsData->speedKmh;
+            out_pct = max(0.0f, min(1.2f, speed_kmh / 60.0f));
+            return true;
+        }
+
         if (m_maxRpm <= 0 || rpms > m_maxRpm) {
             m_maxRpm = rpms;
         }
@@ -447,7 +453,7 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// Universal Dynamic Shift Lights Renderer (Dual-Bar & Single-Bar)
+// Universal Dynamic Shift Lights & Pit Limiter Renderer (Dual-Bar & Single-Bar)
 // ---------------------------------------------------------------------------
 static void render_rev_meter(std::vector<uint8_t>& pkt, const HardwareLayout& hw, float rpm_pct, bool is_limiter, bool flash_state) {
     const float REV_START_PCT = 0.65f;
@@ -465,8 +471,70 @@ static void render_rev_meter(std::vector<uint8_t>& pkt, const HardwareLayout& hw
         }
     };
 
-    // Case 1: Limiter / Shift Flash State
-    if (is_limiter || rpm_pct >= REV_LIMIT_PCT) {
+    // Case 1: Pit Limiter / Pit Lane Speed Guide
+    if (is_limiter) {
+        // If overspeeding in pit lane (> 102% pit speed limit), turn solid RED (no flashing)
+        if (rpm_pct > 1.02f) {
+            uint8_t cr = 255, cg = 0, cb = 0;
+            if (hw.seg1_start >= 0 && hw.seg2_start >= 0) {
+                for (int i = 0; i < hw.seg1_count; i++) set_led(hw.seg1_start + i, cr, cg, cb);
+                for (int i = 0; i < hw.seg2_count; i++) set_led(hw.seg2_start + i, cr, cg, cb);
+            } else if (hw.single_start >= 0) {
+                for (int i = 0; i < hw.single_count; i++) set_led(hw.single_start + i, cr, cg, cb);
+            }
+            return;
+        }
+
+        // Solid proportional fill based on speed (0.0 = stopped, 1.0 = at speed limit)
+        float speed_norm = max(0.0f, min(1.0f, rpm_pct));
+
+        if (hw.seg1_start >= 0 && hw.seg2_start >= 0) {
+            int lit_left  = (int)std::round(speed_norm * (float)hw.seg1_count);
+            int lit_right = (int)std::round(speed_norm * (float)hw.seg2_count);
+
+            // Left Bar (Outer -> Center: Calm Cyan -> Emerald Green)
+            for (int i = 0; i < hw.seg1_count; i++) {
+                int led_offset = hw.seg1_rev ? (hw.seg1_count - 1 - i) : i;
+                int phys_idx = hw.seg1_start + led_offset;
+                if (i < lit_left) {
+                    float pos_pct = (float)i / (float)hw.seg1_count;
+                    uint8_t cr = 0, cg = (uint8_t)(180 + pos_pct * 75), cb = (uint8_t)(255 - pos_pct * 150);
+                    set_led(phys_idx, cr, cg, cb);
+                } else {
+                    set_led(phys_idx, 0, 0, 0);
+                }
+            }
+
+            // Right Bar (Outer -> Center: Calm Cyan -> Emerald Green)
+            for (int i = 0; i < hw.seg2_count; i++) {
+                int led_offset = hw.seg2_rev ? i : (hw.seg2_count - 1 - i);
+                int phys_idx = hw.seg2_start + led_offset;
+                if (i < lit_right) {
+                    float pos_pct = (float)i / (float)hw.seg2_count;
+                    uint8_t cr = 0, cg = (uint8_t)(180 + pos_pct * 75), cb = (uint8_t)(255 - pos_pct * 150);
+                    set_led(phys_idx, cr, cg, cb);
+                } else {
+                    set_led(phys_idx, 0, 0, 0);
+                }
+            }
+        } else if (hw.single_start >= 0) {
+            int half = hw.single_count / 2;
+            int lit_half = (int)std::round(speed_norm * (float)half);
+            for (int i = 0; i < hw.single_count; i++) {
+                int dist_from_center = abs(i - half);
+                int dist_from_edge = half - dist_from_center;
+                if (dist_from_edge < lit_half) {
+                    set_led(hw.single_start + i, 0, 220, 180);
+                } else {
+                    set_led(hw.single_start + i, 0, 0, 0);
+                }
+            }
+        }
+        return;
+    }
+
+    // Case 2: Engine Redline / Shift Flash State
+    if (rpm_pct >= REV_LIMIT_PCT) {
         uint8_t cr = flash_state ? flash_r : 0;
         uint8_t cg = flash_state ? flash_g : 0;
         uint8_t cb = flash_state ? flash_b : 0;
@@ -480,7 +548,7 @@ static void render_rev_meter(std::vector<uint8_t>& pkt, const HardwareLayout& hw
         return;
     }
 
-    // Case 2: Below threshold -> Turn off lightbar LEDs
+    // Case 3: Below threshold -> Turn off lightbar LEDs
     if (rpm_pct < REV_START_PCT) {
         if (hw.seg1_start >= 0 && hw.seg2_start >= 0) {
             for (int i = 0; i < hw.seg1_count; i++) set_led(hw.seg1_start + i, 0, 0, 0);
